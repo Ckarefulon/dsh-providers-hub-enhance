@@ -65,8 +65,9 @@ jobs:
       - name: 确认仓库里没有凭据残留
         shell: bash
         run: |
+          # 跳过 .git 与 .github：本条规则本身就在工作流里，扫自己会自我命中。
           if grep -rInE 'RACCOON_ACCOUNT_[0-9A-F]{8}|gho_[A-Za-z0-9]{20,}|npm_[A-Za-z0-9]{30,}|eyJhbGciOiJIUzI1NiIs' \
-               --exclude-dir=.git .; then
+               --exclude-dir=.git --exclude-dir=.github .; then
             echo "发现疑似凭据，请移除后再提交"
             exit 1
           fi
