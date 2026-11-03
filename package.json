@@ -1,0 +1,49 @@
+{
+  "name": "dsh-raccoon-checkin",
+  "version": "1.0.0",
+  "description": "给 dsh-providers-hub 的 Raccoon（商汤小浣熊）补上每日签到：可重放、可还原、带守卫的 node_modules 补丁器",
+  "type": "module",
+  "bin": {
+    "dsh-raccoon-checkin": "./patch.mjs"
+  },
+  "files": [
+    "patch.mjs",
+    "patch-data.json",
+    "assets",
+    "docs",
+    "README.md",
+    "README.en.md",
+    "LICENSE",
+    "NOTICE.md"
+  ],
+  "scripts": {
+    "patch": "node patch.mjs",
+    "check": "node patch.mjs --check",
+    "revert": "node patch.mjs --revert",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-providers-hub",
+    "raccoon",
+    "sensetime",
+    "xiaohuanxiong",
+    "小浣熊",
+    "每日签到",
+    "patch"
+  ],
+  "author": "Careful S. (Ckarefulon)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ckarefulon/dsh-raccoon-checkin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Ckarefulon/dsh-raccoon-checkin/issues"
+  },
+  "homepage": "https://github.com/Ckarefulon/dsh-raccoon-checkin#readme"
+}

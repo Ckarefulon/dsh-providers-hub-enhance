@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['18', '20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: 语法检查（补丁器）
+        run: node --check patch.mjs
+
+      - name: 补丁描述自检（schema 与资产齐全）
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const data = JSON.parse(fs.readFileSync("patch-data.json", "utf8"));
+            if (!Array.isArray(data.files) || data.files.length === 0) throw new Error("files 为空");
+            for (const file of data.files) {
+              if (!file.path.startsWith("lib/")) throw new Error("非法路径: " + file.path);
+              if (file.mode === "file") {
+                if (!fs.existsSync(file.asset)) throw new Error("资产缺失: " + file.asset);
+                const buf = fs.readFileSync(file.asset);
+                const sha = require("node:crypto").createHash("sha256").update(buf).digest("hex");
+                if (sha !== file.patchedSha256) throw new Error("资产哈希不符: " + file.asset);
+              } else if (file.mode === "anchor") {
+                if (!Array.isArray(file.edits) || file.edits.length === 0) throw new Error("anchor 无 edits: " + file.path);
+                for (const edit of file.edits) {
+                  if (!Array.isArray(edit.find) || !Array.isArray(edit.replace)) throw new Error("锚点结构非法");
+                }
+              } else {
+                throw new Error("未知 mode: " + file.mode);
+              }
+            }
+            console.log("patch-data.json OK: " + data.files.length + " files");
+          '
+
+      - name: 单元测试
+        run: npm test
+
+  secrets:
+    name: 凭据泄漏扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 确认仓库里没有凭据残留
+        shell: bash
+        run: |
+          if grep -rInE 'RACCOON_ACCOUNT_[0-9A-F]{8}|gho_[A-Za-z0-9]{20,}|npm_[A-Za-z0-9]{30,}|eyJhbGciOiJIUzI1NiIs' \
+               --exclude-dir=.git .; then
+            echo "发现疑似凭据，请移除后再提交"
+            exit 1
+          fi
+          echo "未发现疑似凭据"

@@ -1,0 +1,11 @@
+# 统一行尾为 LF：补丁的整文件模式按字节校验 SHA256，行尾被改写会让校验失败。
+* text=auto eol=lf
+
+# assets/ 是「原样安装到 node_modules 的构建产物」，禁止任何转换（含换行符与 diff 归一化）。
+assets/** -text
+
+*.mjs text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.md text eol=lf

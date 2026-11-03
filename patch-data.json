@@ -1,0 +1,161 @@
+{
+  "schema": "dsh-providers-hub/raccoon-checkin/v2",
+  "target": "dsh-providers-hub",
+  "note": "锚点替换用「行数组」表示，应用时按换行拼接。",
+  "files": [
+    {
+      "path": "lib/raccoon.js",
+      "mode": "file",
+      "asset": "assets/raccoon.js",
+      "expectedOriginalSha256": [
+        "39a934c42b95058f3f5ee3d7729ddd9a093dd1d3046a16fb4951d775834ec039"
+      ],
+      "patchedSha256": "348282d1db92e8489b367c05989c75d1eb6b41695c6b48927441354a1f1f0c36"
+    },
+    {
+      "path": "lib/raccoon-credits.js",
+      "mode": "file",
+      "asset": "assets/raccoon-credits.js",
+      "expectedOriginalSha256": [
+        "e3d3472dad175659416b11f230eacdda81c2ee0fde261ce1ebfcbda1ed2ead15"
+      ],
+      "patchedSha256": "0aee88cfb01e4bdf30f6608759eebe8513921121c2106c690cbfb48cb0a1ea6f"
+    },
+    {
+      "path": "lib/raccoon-auth.js",
+      "mode": "anchor",
+      "edits": [
+        {
+          "find": [
+            "import { claimRaccoonLoginReward, fetchRaccoonCreditBalance, fetchRaccoonOnboardingStatus, } from './raccoon-credits.js';"
+          ],
+          "replace": [
+            "import { claimRaccoonDailyCheckin, claimRaccoonLoginReward, fetchRaccoonCreditBalance, fetchRaccoonOnboardingStatus, } from './raccoon-credits.js';"
+          ]
+        },
+        {
+          "find": [
+            "    /** 领取一次性登录奖励。 */",
+            "    async claimLoginReward(credential) {",
+            "        return claimRaccoonLoginReward(this.product, credential, this.fetchImpl);",
+            "    }"
+          ],
+          "replace": [
+            "    /** 领取一次性登录奖励。 */",
+            "    async claimLoginReward(credential) {",
+            "        return claimRaccoonLoginReward(this.product, credential, this.fetchImpl);",
+            "    }",
+            "    /**",
+            "     * 每日签到（办公端 `setting_info` 触发器 + 账单核对）。",
+            "     *",
+            "     * ⚠️ 走实例方法而不是让 `provider-credits` 直接调自由函数：这样注入的",
+            "     *    `fetchImpl`（测试替身 / 代理）不会被绕过，与余额查询同一条口径。",
+            "     */",
+            "    async claimDailyCheckin(credential) {",
+            "        return claimRaccoonDailyCheckin(this.product, credential, this.fetchImpl);",
+            "    }"
+          ]
+        }
+      ]
+    },
+    {
+      "path": "lib/provider-credits.js",
+      "mode": "anchor",
+      "edits": [
+        {
+          "find": [
+            "import { fetchRaccoonCreditBalance } from './raccoon-credits.js';"
+          ],
+          "replace": [
+            "import { fetchRaccoonCreditBalance, claimRaccoonDailyCheckin } from './raccoon-credits.js';"
+          ]
+        },
+        {
+          "find": [
+            "            /**",
+            "             * ⚠️ **raccoon 没有签到端点**：每日 300 积分由服务端按日自动发放",
+            "             *（账单里的 `daily_grant`，实测注册后 1 分钟即到账）⇒ **刻意不提供 `claim`**。",
+            "             * 客户端按能力矩阵（`raccoon: { balance: true, onboardingTasks: true }`，",
+            "             * **无** `dailyCheckin`）根本不会渲染「一键领取积分」按钮。",
+            "             *",
+            "             * ⚠️ 文案**逐字保留**，含那句可操作指引「登录奖励请在『新手任务』中领取」",
+            "             * —— 用户看完才知道下一步该点哪里（压成泛化模板会丢掉它）。",
+            "             */",
+            "            claimUnavailableReason: 'Raccoon Work 不支持每日签到（每日积分由服务端自动发放；'",
+            "                + '登录奖励请在「新手任务」中领取）',"
+          ],
+          "replace": [
+            "            /**",
+            "             * 每日签到 = **办公端 `setting_info` 触发器** + 账单核对。",
+            "             *",
+            "             * ⚠️ 上游**没有** `sign_in` / `check_in` 端点（`/points/v1|v2` 下那一票名字",
+            "             *    全是 404）；真正的触发器是 `GET /api/web/office/v3/setting_info`：",
+            "             *    带桌面端身份头访问一次即**按天幂等**发放当日每日积分，并补发漏发日。",
+            "             *    旧版这里只有 `claimUnavailableReason`（「不支持每日签到」）—— 那是",
+            "             *    「只翻了 points 前缀」导致的误判，已作废。",
+            "             *",
+            "             * ⚠️ 走实例方法（`deps.raccoon.claimDailyCheckin`）以保留注入的 `fetchImpl`；",
+            "             *    未传实例时回退到自由函数，与余额查询同一条口径。",
+            "             */",
+            "            claim: async (credential) => {",
+            "                const viaInstance = deps.raccoon?.claimDailyCheckin;",
+            "                return typeof viaInstance === 'function'",
+            "                    ? await viaInstance.call(deps.raccoon, credential)",
+            "                    : await claimRaccoonDailyCheckin(RACCOON, credential);",
+            "            },"
+          ]
+        }
+      ]
+    },
+    {
+      "path": "lib/provider-registry.js",
+      "mode": "anchor",
+      "edits": [
+        {
+          "find": [
+            "        // ⚠️ 不登记 `dailyCheckin`，且**这不是遗漏**：实测「每日 300 积分」是服务端",
+            "        //    按日自动发放的（账单 `biz_type: 'daily_grant'`），**没有可调用的签到端点**。",
+            "        //    登记它会让用户每次点击都必然失败。",
+            "        //    `onboardingTasks` 是 3000 分的**幂等一次性**桌面端登录奖励。",
+            "        credits: { balance: true, onboardingTasks: true },"
+          ],
+          "replace": [
+            "        // ⚠️ 2026-11-03 本地补丁：登记 `dailyCheckin`。",
+            "        //    旧注释「每日 300 由服务端自动发放、没有可调用的签到端点」是**误判** ——",
+            "        //    那次只翻了 `/points/v1`、`/points/v2`（`sign_in`/`check_in`/`daily` 全 404），",
+            "        //    漏了**办公端**的 `GET /api/web/office/v3/setting_info`：带桌面端身份头",
+            "        //    访问一次即按天幂等发放当日积分，并补发漏发日。实现见",
+            "        //    `raccoon-credits.ts` 的 `claimRaccoonDailyCheckin`。",
+            "        //    `onboardingTasks` 是 3000 分**幂等一次性**登录奖励（桌面端 **+ 手机端** 各一条）。",
+            "        credits: { balance: true, onboardingTasks: true, dailyCheckin: true },"
+          ]
+        }
+      ]
+    },
+    {
+      "path": "lib/client/jet-hub.js",
+      "mode": "anchor",
+      "edits": [
+        {
+          "find": [
+            "    // ⚠️ 不登记 `dailyCheckin`，且**这不是遗漏**：实测「每日 300 积分」是服务端",
+            "    //    按日自动发放的（账单 `biz_type: 'daily_grant'`），**没有可调用的签到端点**。",
+            "    //    登记它会让用户每次点击都必然失败。",
+            "    //    `onboardingTasks` 是 3000 分的**幂等一次性**桌面端登录奖励。",
+            "    credits: { balance: true, onboardingTasks: true },"
+          ],
+          "replace": [
+            "    // ⚠️ 2026-11-03 本地补丁：登记 `dailyCheckin`。",
+            "    //    旧注释「每日 300 由服务端自动发放、没有可调用的签到端点」是**误判** ——",
+            "    //    那次只翻了 `/points/v1`、`/points/v2`（`sign_in`/`check_in`/`daily` 全 404），",
+            "    //    漏了**办公端**的 `GET /api/web/office/v3/setting_info`：带桌面端身份头",
+            "    //    访问一次即按天幂等发放当日积分，并补发漏发日。实现见",
+            "    //    `raccoon-credits.ts` 的 `claimRaccoonDailyCheckin`。",
+            "    //    `onboardingTasks` 是 3000 分**幂等一次性**登录奖励（桌面端 **+ 手机端** 各一条）。",
+            "    credits: { balance: true, onboardingTasks: true, dailyCheckin: true },"
+          ]
+        }
+      ]
+    }
+  ]
+}
