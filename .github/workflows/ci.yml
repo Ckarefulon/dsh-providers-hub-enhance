@@ -24,12 +24,21 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
+      # 语法自检走补丁器自己的**进程内**判据（不 spawn 子进程，受限环境同样可用）。
+      # 必须用脚本文件而非 `node -e`：`-e` 里同时出现 require 与顶层 await 时，
+      # Node 无法判定模块格式会直接抛 ReferenceError。
+      # Node 18 没有 vm.SourceTextModule，故带 flag 的运行只放在 20+ 上；
+      # 18 上自动退化成 new Function 判据（脚本内部已处理）。
       - name: 语法检查（补丁器与新模块）
         shell: bash
-        run: node scripts/ci-syntax-check.mjs
+        run: |
+          if [ "${{ matrix.node }}" = "18" ]; then
+            node scripts/ci-syntax-check.mjs
+          else
+            node --experimental-vm-modules scripts/ci-syntax-check.mjs
+          fi
 
       - name: 补丁描述自检（schema 与资产齐全）
-        shell: bash
         run: node scripts/ci-verify-patch-data.mjs
 
       - name: 单元测试
