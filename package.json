@@ -1,18 +1,24 @@
 {
-  "name": "dsh-raccoon-checkin",
-  "version": "1.0.0",
-  "description": "给 dsh-providers-hub 的 Raccoon（商汤小浣熊）补上每日签到：可重放、可还原、带守卫的 node_modules 补丁器",
+  "name": "dsh-providers-hub-enhance",
+  "version": "1.1.0",
+  "description": "给 dsh-providers-hub 打增强补丁：Raccoon（商汤小浣熊）每日签到 + 限流中断后的「解禁后自动继续」。可重放、可还原、带守卫的 node_modules 补丁器",
   "type": "module",
   "bin": {
-    "dsh-raccoon-checkin": "./patch.mjs"
+    "dsh-providers-hub-enhance": "./patch.mjs"
+  },
+  "exports": {
+    ".": "./patch.mjs",
+    "./patch-data.json": "./patch-data.json"
   },
   "files": [
     "patch.mjs",
     "patch-data.json",
     "assets",
     "docs",
+    "scripts",
     "README.md",
     "README.en.md",
+    "CHANGELOG.md",
     "LICENSE",
     "NOTICE.md"
   ],
@@ -20,7 +26,8 @@
     "patch": "node patch.mjs",
     "check": "node patch.mjs --check",
     "revert": "node patch.mjs --revert",
-    "test": "node --test"
+    "sync-hashes": "node scripts/sync-hashes.mjs",
+    "test": "node --experimental-vm-modules tests/patch.test.mjs && node tests/rate-limit-resume.test.mjs && node tests/client-rate-limit.test.mjs && node --experimental-vm-modules tests/syntax-check.test.mjs"
   },
   "engines": {
     "node": ">=18"
@@ -34,16 +41,19 @@
     "xiaohuanxiong",
     "小浣熊",
     "每日签到",
+    "rate-limit",
+    "限流",
+    "auto-continue",
     "patch"
   ],
   "author": "Careful S. (Ckarefulon)",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Ckarefulon/dsh-raccoon-checkin.git"
+    "url": "git+https://github.com/Ckarefulon/dsh-providers-hub-enhance.git"
   },
   "bugs": {
-    "url": "https://github.com/Ckarefulon/dsh-raccoon-checkin/issues"
+    "url": "https://github.com/Ckarefulon/dsh-providers-hub-enhance/issues"
   },
-  "homepage": "https://github.com/Ckarefulon/dsh-raccoon-checkin#readme"
+  "homepage": "https://github.com/Ckarefulon/dsh-providers-hub-enhance#readme"
 }

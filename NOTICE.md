@@ -8,6 +8,11 @@
 - 用途：`assets/raccoon.js` 与 `assets/raccoon-credits.js` 是该项目构建产物
   （`lib/raccoon.js`、`lib/raccoon-credits.js`）的**修改版本**，由 `patch.mjs` 以整文件替换的方式安装到本机
   `node_modules/dsh-providers-hub/lib/` 下；`patch-data.json` 里针对其余文件的锚点替换同样只作用于该包。
+- `assets/rate-limit-resume.js`（新建的宿主模块）、`assets/client-rate-limit-resume.js` 与
+  `assets/client-styles.js`（插进客户端 bundle 的代码块与 CSS）是**本项目原创**，不是该项目的派生代码；
+  它们被安装进同一个包目录，故在此一并说明。
+- 侧边手法（`agent.followup` 投递、「自有 source kind 不冒充 user」、`ctx.inject(['agents'])` 的挂载）参照了
+  该包自带的 `lib/loop-recovery.js`，属于同一 MIT 许可下的参考实现。
 - 许可：MIT，原文如下。
 
 ```
@@ -49,3 +54,10 @@ SOFTWARE.
 ## 4. DeepSeek Harness
 
 - 本项目是运行在 DeepSeek Harness 上的第三方本地补丁，与其开发方无隶属关系。
+
+## 5. dsh-auto-continue（思路参照，MIT）
+
+- 仓库：<https://github.com/HsiangNianian/dsh-auto-continue>
+- 用途：**仅作设计参照**（「听 `session/event` → 判失败类别 → 到点经 `agent.followup` 投递」这一套手法）。
+  本项目**未复制其代码**：判据、解禁时刻的三条来源、钩子落盘与恢复、UI 形态都是本仓库独立实现，
+  且面向的是「限流解禁」而不是「任意可恢复错误」。

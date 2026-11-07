@@ -1,11 +1,13 @@
-# 🐻 dsh-raccoon-checkin
+# 🐻 dsh-providers-hub-enhance
 
-Adds a working **daily check-in** for the **Raccoon (SenseTime 小浣熊)** channel of
-[dsh-providers-hub](https://www.npmjs.com/package/dsh-providers-hub) — and claims the
-**mobile login reward (+3000 credits)** that upstream never implemented.
+A **re-appliable patcher** that enhances
+[dsh-providers-hub](https://www.npmjs.com/package/dsh-providers-hub). It ships patch
+descriptions, not patched files: after every plugin upgrade, run it again.
 
-The patch touches built artifacts inside `node_modules`, so this project ships a
-**re-appliable patcher** instead of patched files: after every plugin upgrade, run it again.
+| Capability | Summary |
+|---|---|
+| **Raccoon daily check-in** | Also claims the **mobile login reward (+3000 credits)** upstream never implemented |
+| **Resume after rate limiting** | When a turn dies on 429 / exhausted quota, a toggleable icon button appears on the error row and resumes the turn once the limit lifts; a switch in Jet Hub settings decides the default |
 
 ```bash
 node patch.mjs          # apply
@@ -14,13 +16,47 @@ node patch.mjs --revert # undo
 ```
 
 > [!NOTE]
-> Restart DeepSeek Harness after patching (host modules are loaded at process start).
-> Refresh the page afterwards — the Raccoon card then shows the claim button.
+> Restart DeepSeek Harness after patching (host modules load at process start),
+> then refresh the page.
 
-## Why
+## 1. Resume after rate limiting
 
-Upstream states Raccoon has no check-in endpoint. That conclusion comes from only
-probing `/api/web/points/v1|v2` (where `sign_in` / `check_in` / `daily` / `claim` are indeed 404).
+A turn interrupted by 429 / exhausted quota heals by itself — but nobody presses
+"continue" for you, so the task simply stops. This patch adds:
+
+1. **A toggleable icon button at the end of the error row**, only on rate-limit
+   failures:
+   - yellow clock icon + "解禁后自动继续" (armed): resume the turn at the reset time;
+   - red cross icon + "不自动继续" (disarmed): do nothing, you resend manually.
+   - one click flips between the two states.
+2. **A switch at the top of Jet Hub settings** for the **default** of new interruptions,
+   on by default. Records that already exist keep their own state (no retroactive
+   changes) — you may have just toggled them individually.
+3. **Survives restarts**: pending records live in
+   `$DSH_HOME/jet-hub/rate-limit-resume.json`, because a rate limit often lasts an
+   hour and that necessarily spans processes.
+
+Judgement and trade-offs:
+
+- **What counts as rate limiting**: `RATE_LIMIT` code / HTTP 429 (including an
+  **empty-body 429**, common from gateways and CDNs) / `QUOTA` `ACCOUNT_QUOTA` /
+  Chinese and English rate-limit and quota wording in the message.
+- **How long to wait**: the most conservative of ① `providerRetryAfterMs` from the
+  server, ② the **latest future** rate-limit mark for that provider+model in the
+  account pool (max, because one model can be limited to different instants across
+  accounts — better late than one second early), ③ a 1-hour fallback.
+- **Re-checked before firing**: the host re-reads the pool and defers if still limited;
+  deferrals are capped so a "reset time keeps moving" situation cannot loop forever.
+- **When it gives up**: the session is no longer live (`no-live-agent`), the user sent
+  a message, the host started a new turn, or delivery keeps failing.
+- **The continuation never impersonates the user**: it carries its own source kind
+  `rate-limit-resume` and is **never** written as `source.kind === 'user'` (that is
+  the host's proof of direct human input, which `tool-goal` and friends rely on).
+
+## 2. Raccoon daily check-in
+
+Upstream states Raccoon has no check-in endpoint. That conclusion comes from only probing
+`/api/web/points/v1|v2` (where `sign_in` / `check_in` / `daily` / `claim` are indeed 404).
 The real trigger lives on the **office** surface:
 
 | Capability | Endpoint | Notes |
@@ -28,9 +64,9 @@ The real trigger lives on the **office** surface:
 | Daily check-in | `GET /api/web/office/v3/setting_info` | Idempotent per day; also backfills missed days |
 | Mobile login reward | `POST /api/web/mobile/v1/login/points/grant` | One-off **+3000**, independent of the desktop reward |
 
-Observed on real accounts (2026-11-03): one trigger backfilled two missed days **plus** today's
-300 credits; accounts that had already claimed the desktop reward still got `granted: true`
-on the mobile one.
+Observed on real accounts (2026-11-03): one trigger backfilled two missed days **plus**
+today's 300 credits; accounts that had already claimed the desktop reward still got
+`granted: true` on the mobile one.
 
 See [docs/how-it-works.md](docs/how-it-works.md) for the protocol details.
 
@@ -39,33 +75,38 @@ See [docs/how-it-works.md](docs/how-it-works.md) for the protocol details.
 Requires Node.js ≥ 18 and an installed `dsh-providers-hub`.
 
 ```bash
-git clone https://github.com/Ckarefulon/dsh-raccoon-checkin.git
-cd dsh-raccoon-checkin
+git clone https://github.com/Ckarefulon/dsh-providers-hub-enhance.git
+cd dsh-providers-hub-enhance
 node patch.mjs
 ```
 
-The patcher auto-detects `~/.dsh/profiles/{desktop,web}`; otherwise pass
-`--profile <name>` or `--dir <path>`.
+The script finds the plugin under `~/.dsh/profiles/{desktop,web}`; otherwise:
 
-## After a plugin upgrade
+```bash
+node patch.mjs --profile desktop                          # profile name
+node patch.mjs --dir "C:/Users/me/.dsh/profiles/desktop"  # profile or package dir
+```
 
-`node_modules` is replaced wholesale, so the patch disappears — run `node patch.mjs` again.
-The patcher is idempotent and reports “already applied” for untouched files.
+## How it stays safe
 
-Verified against `dsh-providers-hub@1.6.261016` and `2.13.261102`.
+See [patch-data.json](patch-data.json). Four modes:
 
-## Safety
+| mode | Purpose | Guard |
+|---|---|---|
+| `file` | Whole-file replacement | Only for files byte-identical across versions; refuses when the target is neither a known original nor the patched version |
+| `anchor` | Anchor replacement | Every anchor must match **exactly once**; 0 (version changed) or >1 hits aborts the whole run without writing |
+| `anchor-asset` | Insert an asset block at an anchor | Same, plus a `marker` idempotency check |
+| `create` | Create a module file the patch owns | Refuses when the target exists with unknown content; `--revert` only deletes records it created |
 
-- Whole-file replacements are guarded by SHA256: unknown content is never overwritten.
-- Anchor edits must match **exactly once**; otherwise nothing is written.
-- Originals are kept as `<file>.rcc-orig` (`--revert` restores them).
-- A `node --check` syntax pass runs after writing; on failure the patcher rolls back.
+Plus: `.phc-orig` backups, a `.phc-created.json` manifest, and a post-write
+`node --check` syntax pass that rolls back on failure (reported honestly, not
+treated as a syntax error, when subprocesses are unavailable in restricted
+environments).
 
-## Disclaimer
-
-Unofficial local patch. Not affiliated with SenseTime, DeepSeek Harness, or the
-`dsh-providers-hub` author. No credentials are shipped. Use at your own risk.
+> ⚠️ One file can be touched by **several** patch entries (the client bundle is).
+> The patcher groups by **path** and applies them to one in-memory text — reading
+> and writing per entry would make the later entry clobber the earlier one.
 
 ## License
 
-[MIT](LICENSE) — see [NOTICE.md](NOTICE.md) for third-party attribution.
+[MIT](LICENSE)

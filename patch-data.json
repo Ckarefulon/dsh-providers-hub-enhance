@@ -1,7 +1,7 @@
 {
-  "schema": "dsh-providers-hub/raccoon-checkin/v2",
+  "schema": "dsh-providers-hub/enhance/v3",
   "target": "dsh-providers-hub",
-  "note": "锚点替换用「行数组」表示，应用时按换行拼接。",
+  "note": "锚点替换用「行数组」表示，应用时按换行拼接。anchor-asset 把 assets/ 里的一整块代码插进锚点（position 决定前后），marker 用于幂等判定。",
   "files": [
     {
       "path": "lib/raccoon.js",
@@ -153,6 +153,173 @@
             "    //    `raccoon-credits.ts` 的 `claimRaccoonDailyCheckin`。",
             "    //    `onboardingTasks` 是 3000 分**幂等一次性**登录奖励（桌面端 **+ 手机端** 各一条）。",
             "    credits: { balance: true, onboardingTasks: true, dailyCheckin: true },"
+          ]
+        }
+      ]
+    },
+    {
+      "path": "lib/rate-limit-resume.js",
+      "mode": "create",
+      "asset": "assets/rate-limit-resume.js",
+      "patchedSha256": "08fbef64ebd10b393192e584cc95711688cb1be2207e892f0662f7abd46333b8"
+    },
+    {
+      "path": "lib/index.js",
+      "mode": "anchor",
+      "edits": [
+        {
+          "find": [
+            "import { installLoopResume } from './loop-recovery.js';"
+          ],
+          "replace": [
+            "import { installLoopResume } from './loop-recovery.js';",
+            "import { installRateLimitResume } from './rate-limit-resume.js';"
+          ]
+        },
+        {
+          "find": [
+            "    installLoopResume(ctx);"
+          ],
+          "replace": [
+            "    installLoopResume(ctx);",
+            "    // 限流中断后「解禁再继续」：会话因 429 / 额度耗尽而中断时，等解禁时刻",
+            "    // 自动把这一轮续上（初值由 Jet Hub 设置页的开关决定，报错行尾的图标",
+            "    // 按钮可逐个覆盖）。与 `installLoopResume` 并列：两者管的是不同失败类",
+            "    //（那边是「思考陷入重复」，这边是「被服务端限流」），互不吞并。",
+            "    installRateLimitResume(ctx, pool);"
+          ]
+        }
+      ]
+    },
+    {
+      "path": "lib/jet-hub-rpc.js",
+      "mode": "anchor",
+      "edits": [
+        {
+          "find": [
+            "import { handleOpencodeRpc } from './opencode-rpc.js';"
+          ],
+          "replace": [
+            "import { handleOpencodeRpc } from './opencode-rpc.js';",
+            "import {",
+            "    readRateLimitResumeState,",
+            "    setRateLimitResumeArmed,",
+            "    setRateLimitResumeEnabled,",
+            "} from './rate-limit-resume.js';"
+          ]
+        },
+        {
+          "find": [
+            "            default:",
+            "                return { ok: false, error: { code: 'bad-request', message: `unknown method: ${method}` } };",
+            "        }",
+            "    }",
+            "}"
+          ],
+          "replace": [
+            "            // ── 限流中断后「解禁再继续」（本补丁新增）──",
+            "            //",
+            "            // 三条端点都由 `rate-limit-resume.js` 的模块级控制器回答（见那个文件头",
+            "            // 说明「为什么不给本函数加形参」）。控制器缺席（插件装上了但引擎没起来,",
+            "            // 例如宿主没有 `session/event`）时如实回 `available: false` 而不是抛错 ——",
+            "            // 客户端据此把开关与按钮都收掉，界面不该显示一个永远不生效的功能。",
+            "            case 'resume.getState': {",
+            "                const req = payload ?? {};",
+            "                // ⚠️ 带了 `sessionId` 就只回那一个会话的钩子：报错行按钮问的正是",
+            "                // 「这一行还能不能切」，把全机所有会话的钩子一起送下去没有意义",
+            "                //（也把别的会话 id 泄露给了这个页面）。",
+            "                return { ok: true, value: readRateLimitResumeState(req.sessionId) };",
+            "            }",
+            "            case 'resume.setArmed': {",
+            "                const req = payload ?? {};",
+            "                if (typeof req.sessionId !== 'string' || req.sessionId === '') {",
+            "                    return { ok: false, error: { code: 'bad-request', message: 'sessionId 必填' } };",
+            "                }",
+            "                // ⚠️ 与 `gateway.setEnabled` / `nativeSearch.setEnabled` 同约定：",
+            "                // **不做默认值猜测** —— 默认成 true 会静默打开用户特意关掉的开关。",
+            "                if (typeof req.armed !== 'boolean') {",
+            "                    return { ok: false, error: { code: 'bad-request', message: '非空布尔 armed 必填' } };",
+            "                }",
+            "                const hook = setRateLimitResumeArmed(req.sessionId, req.armed);",
+            "                // `hook: null` = 这个会话已经没有待续跑记录（例如用户已在别处重发了",
+            "                // 消息，或解禁后已经投递成功）。客户端把它当成「把按钮收掉」的信号，",
+            "                // 比回一个错误更有用：那本来就不是用户做错了什么。",
+            "                return { ok: true, value: { hook: hook ?? null } };",
+            "            }",
+            "            case 'resume.setEnabled': {",
+            "                const req = payload ?? {};",
+            "                if (typeof req.enabled !== 'boolean') {",
+            "                    return { ok: false, error: { code: 'bad-request', message: '非空布尔 enabled 必填' } };",
+            "                }",
+            "                const enabled = setRateLimitResumeEnabled(req.enabled);",
+            "                if (enabled === undefined) {",
+            "                    return { ok: true, value: { enabled: true, available: false } };",
+            "                }",
+            "                ctx.logger?.info?.(`[jet-hub] ${enabled ? '打开' : '关闭'}「解禁后自动继续」默认值`);",
+            "                return { ok: true, value: { enabled, available: true } };",
+            "            }",
+            "            default:",
+            "                return { ok: false, error: { code: 'bad-request', message: `unknown method: ${method}` } };",
+            "        }",
+            "    }",
+            "}"
+          ]
+        }
+      ]
+    },
+    {
+      "path": "lib/client/jet-hub.js",
+      "mode": "anchor-asset",
+      "asset": "assets/client-rate-limit-resume.js",
+      "marker": "function installRateLimitResumeUi",
+      "position": "after",
+      "anchor": [
+        "var JET_HUB_RPC_CHANNEL = \"/jet-hub\";"
+      ]
+    },
+    {
+      "path": "lib/client/jet-hub.js",
+      "mode": "anchor-asset",
+      "asset": "assets/client-styles.js",
+      "marker": ".dim-jh-resumeToggle",
+      "position": "after",
+      "anchor": [
+        "   esbuild 的报错会指向注释行、看起来像 CSS 写错）。本条注释就曾踩过。 */",
+        ""
+      ]
+    },
+    {
+      "path": "lib/client/jet-hub.js",
+      "mode": "anchor",
+      "edits": [
+        {
+          "find": [
+            "  ctx.effect(() => startCarrierContribution({ rpcCall }), \"jet-hub: zcode 内部载体贡献循环\");"
+          ],
+          "replace": [
+            "  ctx.effect(() => startCarrierContribution({ rpcCall }), \"jet-hub: zcode 内部载体贡献循环\");",
+            "  // 限流中断后「解禁再继续」的客户端半边：报错行尾的图标按钮（黄延时 ⇄ 红叉）",
+            "  // + 设置页顶部的默认开关。状态全部住在宿主（三条 `resume.*` RPC），本地不留",
+            "  // 状态机 —— 关掉标签页再回来按钮还是对的。",
+            "  ctx.effect(() => {",
+            "    const ui = installRateLimitResumeUi({ rpcCall });",
+            "    return () => { ui.dispose(); };",
+            "  }, \"jet-hub: rate-limit resume ui\");"
+          ]
+        },
+        {
+          "find": [
+            "        \"div\",",
+            "        { className: \"dim-jh-headerActions\" },",
+            "        // 「供应商开关」在页头，而不是左侧每个供应商行尾（!25 的原形态）："
+          ],
+          "replace": [
+            "        \"div\",",
+            "        { className: \"dim-jh-headerActions\" },",
+            "        // 「解禁后自动继续」的**默认值**开关（本补丁新增）。放在按钮行第一个：",
+            "        // 它是策略级开关，与右边那排一次性动作（供应商 / 签到 / 网关 / 用量）不同类。",
+            "        React2.createElement(PhcResumeDefaultSwitch, { rpcCall }),",
+            "        // 「供应商开关」在页头，而不是左侧每个供应商行尾（!25 的原形态）："
           ]
         }
       ]

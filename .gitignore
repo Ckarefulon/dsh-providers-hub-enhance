@@ -1,5 +1,6 @@
-# 还原时生成的备份
-*.rcc-orig
+# 还原时生成的备份（以及新建文件清单）
+*.phc-orig
+.phc-created.json
 
 # 依赖 / 构建产物
 node_modules/

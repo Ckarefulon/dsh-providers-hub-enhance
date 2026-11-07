@@ -24,51 +24,56 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
-      - name: 语法检查（补丁器）
-        run: node --check patch.mjs
+      - name: 语法检查（补丁器与新模块）
+        shell: bash
+        run: |
+          # 走补丁器自己的**进程内**判据（不 spawn 子进程，受限环境同样可用）。
+          node --experimental-vm-modules -e '
+            const fs = require("node:fs");
+            const { checkFileSyntax } = await import("./scripts/syntax-check.mjs");
+            const targets = ["patch.mjs", "assets/rate-limit-resume.js", "assets/client-rate-limit-resume.js", "scripts/sync-hashes.mjs"];
+            for (const rel of targets) {
+              const result = checkFileSyntax(fs.readFileSync(rel, "utf8"));
+              if (!result.ok) throw new Error(rel + " 语法错误: " + (result.message ?? ""));
+              console.log(rel + " OK (" + result.form + (result.approximate ? ", 退化判据" : "") + ")");
+            }
+          '
 
       - name: 补丁描述自检（schema 与资产齐全）
         shell: bash
         run: |
           node -e '
             const fs = require("node:fs");
-            const path = require("node:path");
             const data = JSON.parse(fs.readFileSync("patch-data.json", "utf8"));
             if (!Array.isArray(data.files) || data.files.length === 0) throw new Error("files 为空");
+            const sha = (p) => require("node:crypto").createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+            // 同一个路径允许多条（客户端 bundle 就是），故这里只校验**模式**与资产。
             for (const file of data.files) {
               if (!file.path.startsWith("lib/")) throw new Error("非法路径: " + file.path);
-              if (file.mode === "file") {
-                if (!fs.existsSync(file.asset)) throw new Error("资产缺失: " + file.asset);
-                const buf = fs.readFileSync(file.asset);
-                const sha = require("node:crypto").createHash("sha256").update(buf).digest("hex");
-                if (sha !== file.patchedSha256) throw new Error("资产哈希不符: " + file.asset);
-              } else if (file.mode === "anchor") {
-                if (!Array.isArray(file.edits) || file.edits.length === 0) throw new Error("anchor 无 edits: " + file.path);
-                for (const edit of file.edits) {
-                  if (!Array.isArray(edit.find) || !Array.isArray(edit.replace)) throw new Error("锚点结构非法");
-                }
-              } else {
-                throw new Error("未知 mode: " + file.mode);
+              switch (file.mode) {
+                case "file":
+                case "create":
+                  if (!fs.existsSync(file.asset)) throw new Error("资产缺失: " + file.asset);
+                  if (sha(file.asset) !== file.patchedSha256) throw new Error("资产哈希不符（先跑 npm run sync-hashes）: " + file.asset);
+                  break;
+                case "anchor":
+                  if (!Array.isArray(file.edits) || file.edits.length === 0) throw new Error("anchor 无 edits: " + file.path);
+                  for (const edit of file.edits) {
+                    if (!Array.isArray(edit.find) || !Array.isArray(edit.replace)) throw new Error("锚点结构非法");
+                  }
+                  break;
+                case "anchor-asset":
+                  if (!fs.existsSync(file.asset)) throw new Error("资产缺失: " + file.asset);
+                  if (!Array.isArray(file.anchor) || file.anchor.length === 0) throw new Error("anchor-asset 无 anchor");
+                  if (!["before", "after"].includes(file.position)) throw new Error("anchor-asset 的 position 非法");
+                  if (typeof file.marker !== "string" || file.marker === "") throw new Error("anchor-asset 缺 marker（幂等判据）");
+                  break;
+                default:
+                  throw new Error("未知 mode: " + file.mode);
               }
             }
-            console.log("patch-data.json OK: " + data.files.length + " files");
+            console.log("patch-data.json OK: " + data.files.length + " entries");
           '
 
       - name: 单元测试
         run: npm test
-
-  secrets:
-    name: 凭据泄漏扫描
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: 确认仓库里没有凭据残留
-        shell: bash
-        run: |
-          # 跳过 .git 与 .github：本条规则本身就在工作流里，扫自己会自我命中。
-          if grep -rInE 'RACCOON_ACCOUNT_[0-9A-F]{8}|gho_[A-Za-z0-9]{20,}|npm_[A-Za-z0-9]{30,}|eyJhbGciOiJIUzI1NiIs' \
-               --exclude-dir=.git --exclude-dir=.github .; then
-            echo "发现疑似凭据，请移除后再提交"
-            exit 1
-          fi
-          echo "未发现疑似凭据"

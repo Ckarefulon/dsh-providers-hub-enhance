@@ -86,11 +86,80 @@ GET /api/web/points/v2/bills?paging.limit=100&type=income
 | `lib/raccoon-auth.js` | `claimDailyCheckin()` 实例方法（走注入的 `fetchImpl`，测试替身/代理不被绕过） |
 | `lib/provider-credits.js` | Raccoon 的 `claim` 实现（替换 `claimUnavailableReason`） |
 | `lib/provider-registry.js` / `lib/client/jet-hub.js` | `credits.dailyCheckin: true`（面板才会渲染签到按钮） |
+| `lib/rate-limit-resume.js` | **新建**：限流判据、解禁时刻推算、待续跑钩子（落盘 + 恢复）、`agent.followup` 投递 |
+| `lib/index.js` | `installRateLimitResume(ctx, pool)`（与 `installLoopResume` 并列，管的是不同失败类） |
+| `lib/jet-hub-rpc.js` | 三条端点 `resume.getState` / `resume.setArmed` / `resume.setEnabled` |
+| `lib/client/jet-hub.js` | 报错行尾图标按钮（DOM 增强）+ 设置页顶部默认开关 |
 
 `auto-checkin`（每日首次启动自动签到）不需要改：它按「账号池里真的有账号的渠道」逐渠道调
 `claim`，Raccoon 有了 `claim` 就会自动带上。
 
-## 7. 踩坑记录（探测协议时的注意事项）
+## 7. 限流中断后的「解禁后自动继续」
+
+### 判据：什么才算「等得及」
+
+| 信号 | 归类 | 为什么 |
+|---|---|---|
+| `code === 'RATE_LIMIT'` | rate | providers-hub 的 `httpErrorCode(429)` 就映射到它 |
+| `status === 429` | rate | **必须早于文案判据**：网关 / CDN 可以回**空体** 429 |
+| `code === 'QUOTA' / 'ACCOUNT_QUOTA'` | quota | 上游按日或按窗口封，仍有解禁时刻 |
+| 正文含「限流 / 频率 / too many requests / rate limit」 | rate | 部分渠道只把话写进正文 |
+| 正文含「额度 / 积分不足 / 14018 / credits exhausted」 | quota | 同上 |
+
+不该归进来的：`INVALID_REQUEST`(400)、`AUTH`(401/403)、`SERVER`(5xx) ——
+那些等一会儿也不会自愈，自动续跑只会掩盖真故障。
+
+### 解禁时刻：三条来源取**最保守**
+
+1. `providerRetryAfterMs`（服务端指定的机器通道，`LlmError` 校验里要求 `> 0`）；
+2. 账号池里该 provider + 模型的**未来最晚**限流标记（`pool.listAccountsByProvider()` 的
+   `modelRateLimits[model]` 取 max）—— 取 max 是因为同一模型上 A 号可能封 1 小时、B 号封
+   24 小时，「等谁」没有唯一答案；宁可晚一点（那时整池都解了）也不要早一秒去撞墙；
+3. 兜底 1 小时（与 providers-hub 自己的 429 冷却同档）。
+
+等待时长夹在 `[5 秒, 48 小时]`：下界防「解禁时刻已经过去」时在同一轮里连打；上界防
+`setTimeout` 收到超过 2^31-1 的延时（Node 会给 1ms 警告并**立即触发**，那是真实的
+「醒来太早」缺陷）。
+
+### 到点之后
+
+先**复核**池里是否仍未解禁（被推后则顺延，延后次数有上限，防「解禁时刻被反复推后」
+无限循环），再经 `agent.followup` 投递。投递失败分两类：
+
+| 形态 | 处理 |
+|---|---|
+| `no-live-agent` | **直接放弃**（会话已不在内存，没有「继续」的对象） |
+| 其余（agents 未就绪 / 宿主抖动） | 按 5 分钟重试，钩子留着 |
+
+### ⚠️ 续跑消息绝不冒充用户
+
+`source.kind === 'user'` 是宿主对「直接人类输入」的**证明**，`tool-goal` 的增删改都据此
+授权（见 providers-hub 的 `loop-recovery.ts` 模块头）。伪造它等于让自动续跑**冒用人类
+授权**，UI 也会把它渲染成用户发言。故这里用自己的来源标识 `rate-limit-resume`，如实署名。
+
+### 钩子为什么要落盘
+
+「等 1 小时」必然跨越宿主重启（DSH 一天重启几次很正常）。只在内存里记的钩子会随进程
+消失，用户第二天回来看到的就是「什么都没发生」。故写
+`$DSH_HOME/jet-hub/rate-limit-resume.json`（与 `ui-preferences.json` 同目录、同原子写
+tmp+rename 惯例），启动时恢复，恢复时丢弃无效 / 过旧记录。
+
+### 客户端那半边
+
+报错行（`.…_turnErrorRow`，类名哈希每次构建都变，**按后缀匹配**）没有任何插槽可挂，
+故走 DOM 增强：一个 MutationObserver + 幂等标记。按钮是**原生 DOM** 不是 React 元素 ——
+那个位置不在任何 React 树里，塞 React 元素只会渲染成 `[object Object]`（客户端 bundle
+只有 `require('react')`，没有 `react-dom`）。
+
+按钮状态**全部由宿主回答**（`resume.getState`）：本地不留状态机，所以关掉标签页再回来、
+甚至宿主重启之后再打开，按钮都是对的。
+
+### 设置页那个开关的语义
+
+它改的是**默认值**（新中断的初值），**不追溯**已有记录 —— 追溯会把用户刚逐个点过的
+按钮悄悄改回去。
+
+## 8. 踩坑记录（探测协议时的注意事项）
 
 - **绝不用 POST 去试探端点是否存在**：`POST /api/web/auth/v1/logout` 会真的把当前 session 销掉
   （access + refresh 全部 401，只能重新扫码）。探测只用 GET；POST-only 路由在 GET 下同样 404，
