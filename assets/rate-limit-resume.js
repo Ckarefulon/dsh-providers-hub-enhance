@@ -79,10 +79,45 @@ const DELIVER_RETRY_MS = 5 * 60 * 1000;
 /** 同时挂着的钩子上限（正常使用远达不到，纯粹防止异常场景无限增长）。 */
 const MAX_HOOKS = 64;
 
-/** 「频率限制」的自然语言兜底（与 providers-hub 的 `RATE_LIMIT_PATTERN` 同口径加少量变体）。 */
-const RATE_TEXT_PATTERN = /频率限制|频率超出|使用量已超出|请求过于频繁|too\s+many\s+requests|rate[\s_-]?limit|frequency\s+limit|usage\s+exceeds|throttl/i;
-/** 「额度耗尽」的自然语言兜底。 */
+/**
+ * 「限流」的自然语言兜底。
+ *
+ * ⚠️ **必须收「限流 / 受限 / 解禁」这几个字**：providers-hub 自己的报错文案用的是
+ * 中文「均在限流中」「所有账号均受限」「XX 将于 <时刻> 解禁」，而早期版本只写了
+ * 「频率限制 / 请求过于频繁」这类**同义词**，于是一条真实的限流报错（
+ * `QUOTA_EXCEEDED` + 「可用账号均在限流中」）在结构化码与文案两处**双双落空**，
+ * 功能等于没装。教训：兜底正则要照真机上真实出现过的**原文**写，不要照想象的同义词写。
+ *
+ * `解禁` 单独列出：它只出现在「等到某个时刻」的语境里，语义等价于限流。
+ */
+const RATE_TEXT_PATTERN = /限流|受限|解禁|频率限制|频率超出|使用量已超出|请求过于频繁|too\s+many\s+requests|rate[\s_-]?limit|frequency\s+limit|usage\s+exceeds|throttl/i;
+
+/**
+ * 「额度真的耗尽」的自然语言兜底（**不是**限流，等到解禁也不会好）。
+ *
+ * ⚠️ 与 {@link RATE_TEXT_PATTERN} 的**判据顺序**是刻意的：先限流、后额度。
+ * 「额度已用尽」这类文案里通常不含「限流」字样，故不会互相抢；但像
+ * 「所有账号均不可用（限流或额度耗尽）」这种**两者都提**的，归限流 ——
+ * 那是「等一会儿可能就好了」的方向，比「等到明天也没用」更保守。
+ */
 const QUOTA_TEXT_PATTERN = /14018|credits?\s+exhausted|配额|额度|积分(不足|耗尽|用尽)|余额(不足|耗尽)|insufficient\s+(quota|balance|credits?)|quota\s+(exceeded|exhausted)|out\s+of\s+credits?/i;
+
+/**
+ * 结构化码里**确定是限流**的那些。
+ *
+ * `QUOTA_EXCEEDED` 必须在内：providers-hub 把「账号池里该模型的号全被限流」
+ * 报成这个码（`index.js` 的 `throwIfAllAccountsRateLimited`、buddy / codearts /
+ * gemini / opencode / loomy 各适配器同型），上游自己的 `account-probe.js`
+ * `isRateLimitFailure()` 也是这么认的（注释里写明「两者都认，避免因词汇差异
+ * 把限流误判成未知错误」）。
+ *
+ * ⚠️ 但 `QUOTA_EXCEEDED` **不等于**限流：trae 的「积分不足」、accio 的
+ * 「额度或认证失败」用的是同一个码，那是真·额度耗尽 / 认证问题，等到解禁也不会好。
+ * ⇒ 故它**只作为线索**：命中后还要过一遍 {@link QUOTA_TEXT_PATTERN} 与
+ * {@link RATE_TEXT_PATTERN}，两者都不命中时按「额度类」处理（保守：仍记录钩子，
+ * 但类别是 quota —— 那正是 `trae` 那类文案的落点）。
+ */
+const RATE_CODES = new Set(['RATE_LIMIT', 'RATE_LIMITED', 'TOO_MANY_REQUESTS']);
 
 function isRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -93,27 +128,34 @@ function isRecord(value) {
  *
  * ## 判据顺序必须是「结构化 → 状态码 → 文案」
  *
- * 结构化码（`RATE_LIMIT` / `QUOTA` / `ACCOUNT_QUOTA`）与 HTTP 429 是**与语言无关**
- * 的事实；文案兜底只服务于那些把错误塞进正文的渠道（providers-hub 的十来个适配器
- * 各有各的形态，且部分渠道的限流是「模型饱和」这类只有文案的信号）。
+ * 结构化码与 HTTP 429 是**与语言无关**的事实；文案兜底只服务于那些把错误塞进正文的
+ * 渠道（providers-hub 的十来个适配器各有各的形态，且部分渠道的限流是「模型饱和」
+ * 这类只有文案的信号）。
  *
  * ⚠️ **`status === 429` 必须早于文案**：网关 / CDN 可以回**空体** 429，那时任何
  * 文案判据都不命中 —— 而它正是最典型的限流。
  *
+ * ⚠️ **`QUOTA_EXCEEDED` 不能单独判成限流**：它是 providers-hub 里「号全被限流」
+ * 与「积分真的用尽」共用的码。真机实测（2026-11-07）那条报错是
+ * `QUOTA_EXCEEDED` + 「可用账号均在限流中 …… 解禁」，故它走文案；
+ * 而 trae 的「积分不足」同样带这个码却没有「限流」字样 ⇒ 落到额度类。
+ * 两者都会记钩子，区别只在于「等多久」的语义。
+ *
  * @param failure - `turn/end` 的 `reason.error`（未知形状按「不是」处理）。
- * @returns {@link RESUME_CLASS_RATE} / {@link RESUME_CLASS_QUOTA} / `undefined`。
+ * @returns {@link CLASS_RATE} / {@link CLASS_QUOTA} / `undefined`。
  */
 export function classifyRateLimitFailure(failure) {
     if (!isRecord(failure)) return undefined;
     const code = typeof failure.code === 'string' ? failure.code : undefined;
     const status = typeof failure.status === 'number' ? failure.status : undefined;
-    if (code === 'RATE_LIMIT') return CLASS_RATE;
+    if (code !== undefined && RATE_CODES.has(code)) return CLASS_RATE;
     if (status === 429) return CLASS_RATE;
-    if (code === 'QUOTA' || code === 'ACCOUNT_QUOTA') return CLASS_QUOTA;
     const detail = [typeof failure.message === 'string' ? failure.message : '',
         typeof failure.code === 'string' ? failure.code : ''].filter((part) => part !== '').join(' ');
-    if (detail === '') return undefined;
+    // 文案优先于「额度类结构化码」：真机那条 `QUOTA_EXCEEDED` 正是靠「限流」二字
+    // 才被认出来的（见函数头注释）。
     if (RATE_TEXT_PATTERN.test(detail)) return CLASS_RATE;
+    if (code === 'QUOTA' || code === 'ACCOUNT_QUOTA' || code === 'QUOTA_EXCEEDED') return CLASS_QUOTA;
     if (QUOTA_TEXT_PATTERN.test(detail)) return CLASS_QUOTA;
     return undefined;
 }
@@ -136,14 +178,23 @@ export function resetAtFromFailure(failure, now) {
 }
 
 /**
- * 从账号池条目里取「该模型最晚的解禁时刻」。
+ * 从账号池条目里取「该模型最早的解禁时刻」。
  *
- * ## 为什么取 **max** 而不是第一条
+ * ## ⚠️ 判据必须与上游 `allAccountsRateLimitedForModel()` 完全同口径
  *
- * `modelRateLimits` 是**每个账号**各自一张表（键 = 模型 id）。同一模型上 A 号封
- * 1 小时、B 号封 24 小时（额度）时，下一次请求会先落在 A（顺序优先且 A 已解禁），
- * 于是「等谁」没有唯一答案。取 **max** 是保守方向：宁可晚一点续跑（那时整池都解了），
- * 也不要早一秒去撞墙 —— 撞墙只会再烧一次请求并把冷却推后。
+ * 两件事都要对，缺一个就会出现「该续跑时不续、不该续跑时白等」：
+ *
+ * 1. **取 min 而不是 max**。上游 `account-pool.js` 取 `Math.min` —— 因为**只要有一个
+ *    号解禁，请求就能落上去**（选号挑第一个未受限的）。取 max 会让用户在本可续跑的
+ *    时刻干等（A 号 1 分钟解禁、B 号被额度封 24 小时 ⇒ 白等一天）。早期这里写的正是
+ *    max，注释还辩称「宁可晚一点也不要撞墙」——那是错的：撞墙的代价只是一次失败
+ *    重试（{@link DELIVER_RETRY_MS} 之后再来），白等一天的代价是功能彻底不可用。
+ * 2. **「全部受限」才算数**。只要有一个启用账号**没有**该模型的未来标记，就说明
+ *    现在就能发请求 ⇒ 返回 `undefined`，让调用方立刻投递，而不是等别人。
+ *    只看「有标记的那些里最早的」，会把「A 已解禁、B 还在限」误判成「要等到 B」。
+ *
+ * 另外按上游一致地**只看启用账号**：停用账号本就不参与选号，把它算进「全受限」
+ * 会让「有一个号被停用」这种普通情况被误判成整池封禁。
  *
  * ⚠️ 只认 **未来** 的标记：过期标记（`<= now`）由池自己的 sweep 清理，这里不该拿它
  * 当「正在限流」的证据，否则会白等一整轮。
@@ -151,19 +202,27 @@ export function resetAtFromFailure(failure, now) {
  * @param accounts - `pool.listAccountsByProvider(provider)` 的返回值（未知形状按空处理）。
  * @param model - 模型 id（限流标记的键）。
  * @param now - 当前时刻。
- * @returns 最晚的未来解禁时刻；一条都没有时 `undefined`。
+ * @returns 全部启用账号都受限时，返回**最早**的解禁时刻；否则 `undefined`。
  */
-function modelResetAt(accounts, model, now) {
+export function modelResetAt(accounts, model, now) {
     if (typeof model !== 'string' || model === '') return undefined;
     if (!Array.isArray(accounts)) return undefined;
-    let latest = 0;
+    let earliest;
+    let considered = 0;
     for (const account of accounts) {
-        const marks = isRecord(account) ? account.modelRateLimits : undefined;
-        if (!isRecord(marks)) continue;
-        const at = marks[model];
-        if (typeof at === 'number' && Number.isFinite(at) && at > now && at > latest) latest = at;
+        if (!isRecord(account)) continue;
+        // 与上游 `allAccountsRateLimitedForModel` 同口径：只看启用账号。
+        if (account.enabled === false) continue;
+        considered += 1;
+        const marks = account.modelRateLimits;
+        const at = isRecord(marks) ? marks[model] : undefined;
+        // 缺标记 / 非数字 / 已过期 ⇒ 这个号现在就可发请求 ⇒ 整体「并非全受限」。
+        if (typeof at !== 'number' || !Number.isFinite(at) || at <= now) return undefined;
+        if (earliest === undefined || at < earliest) earliest = at;
     }
-    return latest > 0 ? latest : undefined;
+    // 一个启用账号都没有：无法证明「正在限流」，交给兜底等待。
+    if (considered === 0) return undefined;
+    return earliest;
 }
 
 /**

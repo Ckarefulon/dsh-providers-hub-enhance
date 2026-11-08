@@ -332,9 +332,15 @@ export function runPatch(argv, options = {}) {
         deletions.push({ abs, path: relPath });
         continue;
       }
+      // ⚠️ 清单里登记过这个路径 ⇒ **就是本补丁自己建的**（只是补丁升级后哈希变了）。
+      //    这种情况必须允许直接覆盖：否则每次改资产内容，用户都得手动 `--force`，
+      //    而那个开关本来是为「别人写的同名文件」准备的。清单是唯一的归属证据。
+      // 注意作用域：`ownedByUs` 要活到下面的 `pending.push`，故在 `if` 外声明。
+      const manifestForCreate = readManifest(target.dir);
+      const ownedByUs = manifestForCreate !== null && manifestForCreate.has(relPath);
       if (existsSync(abs)) {
         if (sha256(readFileSync(abs)) === assetSha) { done('applied', { message: '已应用（新建）' }); continue; }
-        if (!args.force) {
+        if (!ownedByUs && !args.force) {
           report.ok = false;
           report.problems.push(
             `${relPath}: 目标已存在且内容不是本补丁那一版（sha256=${sha256(readFileSync(abs))}）。`
@@ -344,8 +350,9 @@ export function runPatch(argv, options = {}) {
           continue;
         }
       }
-      pending.push({ abs, path: relPath, bytes: assetBytes, text: null, action: '新建文件' });
-      newlyCreated.add(relPath);
+      pending.push({ abs, path: relPath, bytes: assetBytes, text: null, action: ownedByUs ? '更新（本补丁先前创建的文件）' : '新建文件' });
+      // 只有**真的新建**时才登记：覆盖既有文件不该让 `--revert` 去删它。
+      if (!existsSync(abs)) newlyCreated.add(relPath);
       continue;
     }
 

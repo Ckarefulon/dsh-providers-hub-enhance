@@ -161,7 +161,7 @@
       "path": "lib/rate-limit-resume.js",
       "mode": "create",
       "asset": "assets/rate-limit-resume.js",
-      "patchedSha256": "08fbef64ebd10b393192e584cc95711688cb1be2207e892f0662f7abd46333b8"
+      "patchedSha256": "645dde8a6244e512e9a681b2cd433a9d7160780e5c120a3d33be0a1ebd971b1e"
     },
     {
       "path": "lib/index.js",

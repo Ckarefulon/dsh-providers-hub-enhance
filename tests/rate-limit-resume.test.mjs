@@ -59,6 +59,7 @@ function loadEngine() {
   const names = [
     'classifyRateLimitFailure',
     'resetAtFromFailure',
+    'modelResetAt',
     'nextResumeDelay',
     'sanitizeHook',
     'createRateLimitResumeEngine',
@@ -88,6 +89,55 @@ test('429（空体、无文案）与额度耗尽都被判为「等解禁」类',
   assert.equal(engine.classifyRateLimitFailure('429'), undefined);
 });
 
+// ===== 真机回归：这些字符串是**从真实会话日志里抄下来的**，不是想象的样例 =====
+//
+// ⚠️ 上面那组用例全部通过、功能却在真机上完全不工作（2026-11-07 用户报障
+// 「除了设置里多了个按钮，报错后没有那个按钮，也没有自动继续」）。原因就是
+// 上面只用了**想象中的**关键词：真实报错码是 `QUOTA_EXCEEDED`（既不等于
+// `QUOTA` 也不是 `RATE_LIMIT`），真实文案写的是「**均在限流中**」而正则里
+// 只有「频率限制」。两条判据双双落空 ⇒ 钩子从未创建 ⇒ 状态文件里 hooks 恒为 []。
+//
+// 教训：凡「按文案判」的分支，用例必须用**上游源码里真实存在的**字符串。
+test('真机回归：Raccoon「可用账号均在限流中」必须被判成限流', () => {
+  const engine = loadEngine();
+  // 原文来自 `~/.dsh/sessions/**/session.v4.jsonl.zstd` 的 turn/end 事件，
+  // 由 providers-hub `lib/index.js` 的 `throwIfAllAccountsRateLimited()` 抛出。
+  const real = {
+    message: 'Raccoon (商汤)：模型 sn-deepseek-v4-1-flash-1017 的可用账号均在限流中，'
+      + '最近一个将于 2026/11/7 00:05:59 解禁。可改用其它 provider / 模型，'
+      + '或等待解禁后再试（无需重新登录）。',
+    code: 'QUOTA_EXCEEDED',
+  };
+  // 结构化码不是 RATE_LIMIT、没有 status，只能靠文案 —— 这正是真机情形。
+  assert.equal(engine.classifyRateLimitFailure(real), 'rate');
+});
+
+test('真机回归：上游各适配器「受限 / 限流」类文案都归 rate', () => {
+  const engine = loadEngine();
+  // 每条都抄自 `dsh-providers-hub/lib/*.js` 的 throw 站点。
+  const cases = [
+    'buddy: 模型 gpt-4 所有账号均受限，请稍后再试',
+    'codearts: 模型 x 所有账号均受限，请稍后再试',
+    'opencode: 所有通道对该模型均受限',
+    'gemini: 模型 x 的所有账号均不可用（限流或额度耗尽），请稍后再试',
+  ];
+  for (const message of cases) {
+    assert.equal(
+      engine.classifyRateLimitFailure({ message, code: 'QUOTA_EXCEEDED' }),
+      'rate',
+      `应判为限流：${message}`,
+    );
+  }
+});
+
+test('真机回归：QUOTA_EXCEEDED 里真正是「额度用尽」的不许判成限流', () => {
+  const engine = loadEngine();
+  // trae / accio 用同一个码表示真·额度耗尽或认证失败 —— 等到解禁也不会好，
+  // 归 `quota`（仍记钩子，但语义是「等额度」而不是「等限流解除」）。
+  assert.equal(engine.classifyRateLimitFailure({ message: 'trae: 积分不足（余额 0）', code: 'QUOTA_EXCEEDED' }), 'quota');
+  assert.equal(engine.classifyRateLimitFailure({ message: 'accio: 额度或认证失败（402）', code: 'QUOTA_EXCEEDED' }), 'quota');
+});
+
 test('providerRetryAfterMs 转成绝对解禁时刻；非法值不认', () => {
   const engine = loadEngine();
   const now = 1_000_000;
@@ -95,6 +145,55 @@ test('providerRetryAfterMs 转成绝对解禁时刻；非法值不认', () => {
   assert.equal(engine.resetAtFromFailure({ providerRetryAfterMs: 0 }, now), undefined);
   assert.equal(engine.resetAtFromFailure({ providerRetryAfterMs: -1 }, now), undefined);
   assert.equal(engine.resetAtFromFailure({}, now), undefined);
+});
+
+// ===== modelResetAt：必须与上游 allAccountsRateLimitedForModel() 同口径 =====
+//
+// 早期这里取的是 max（「等最后一个号解禁」），与上游的 min 相反 ⇒ 会白等。
+// 上游语义：**只要有一个号解禁，请求就能落上去**，故等最早那个。
+test('modelResetAt：全部账号都受限时取**最早**的解禁时刻（不是最晚）', () => {
+  const engine = loadEngine();
+  const now = 1_000_000;
+  const accounts = [
+    { id: 'a', enabled: true, modelRateLimits: { m: now + 60_000 } },
+    { id: 'b', enabled: true, modelRateLimits: { m: now + 24 * 3600_000 } },
+  ];
+  assert.equal(engine.modelResetAt(accounts, 'm', now), now + 60_000, '应等最早解禁的那个号');
+});
+
+test('modelResetAt：只要有一个号没在限流，就返回 undefined（现在就发）', () => {
+  const engine = loadEngine();
+  const now = 1_000_000;
+  // a 号在限流，b 号干净 ⇒ 不是「全受限」，不该等。
+  assert.equal(engine.modelResetAt([
+    { id: 'a', enabled: true, modelRateLimits: { m: now + 3600_000 } },
+    { id: 'b', enabled: true },
+  ], 'm', now), undefined);
+  // 标记已过期同理（池自己会 sweep，不该当「正在限流」的证据）。
+  assert.equal(engine.modelResetAt([
+    { id: 'a', enabled: true, modelRateLimits: { m: now + 3600_000 } },
+    { id: 'b', enabled: true, modelRateLimits: { m: now - 1 } },
+  ], 'm', now), undefined);
+});
+
+test('modelResetAt：停用账号不参与「全受限」判定（与上游一致）', () => {
+  const engine = loadEngine();
+  const now = 1_000_000;
+  // 唯一的干净号被停用 ⇒ 仍然算「全受限」，等限流那个解禁。
+  assert.equal(engine.modelResetAt([
+    { id: 'a', enabled: true, modelRateLimits: { m: now + 60_000 } },
+    { id: 'b', enabled: false },
+  ], 'm', now), now + 60_000);
+});
+
+test('modelResetAt：空模型 id / 空池 / 脏形状都不认', () => {
+  const engine = loadEngine();
+  const now = 1_000_000;
+  assert.equal(engine.modelResetAt([{ enabled: true, modelRateLimits: { m: now + 1 } }], '', now), undefined);
+  assert.equal(engine.modelResetAt([], 'm', now), undefined);
+  assert.equal(engine.modelResetAt(null, 'm', now), undefined);
+  assert.equal(engine.modelResetAt([{ enabled: false, modelRateLimits: { m: now + 1 } }], 'm', now), undefined);
+  assert.equal(engine.modelResetAt([{ enabled: true, modelRateLimits: 'nope' }], 'm', now), undefined);
 });
 
 test('等待时长夹在 [5 秒, 48 小时]，不产生「立即触发」的怪值', () => {

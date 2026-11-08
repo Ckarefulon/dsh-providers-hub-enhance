@@ -32,8 +32,12 @@ const MIXED_ORIGINAL = 'const mixed = 1;\n// MARK:anchor\n// MARK:end\n';
 const MIXED_BLOCK = '// MARK:block\nexport function inserted() {}\n';
 const MIXED_PATCHED = 'const mixed = 2;\n// MARK:anchor\n// MARK:block\nexport function inserted() {}\n// MARK:end\n';
 
-/** 造一个临时环境：假插件包 + 假补丁描述 + 假资产。 */
-function makeFixture() {
+/**
+ * 造一个临时环境：假插件包 + 假补丁描述 + 假资产。
+ *
+ * @param t - `node:test` 的测试上下文；用于登记临时目录的清理（缺省则靠进程退出兜底）。
+ */
+function makeFixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'phc-test-'));
   const pkg = join(root, 'dsh-providers-hub');
   mkdirSync(join(pkg, 'lib'), { recursive: true });
@@ -88,11 +92,16 @@ function makeFixture() {
   const run = (extra = []) => runPatch(
     ['--dir', pkg, '--data', join(root, 'patch-data.json'), '--no-verify', ...extra],
   );
+  // ⚠️ 必须登记清理：`mkdtempSync` 造在系统临时目录里，不删就会每次跑测试都留一批
+  //    `phc-test-*` 目录（实测这批夹具一度堆到上百个）。`t.after` 即使断言失败也会执行。
+  if (t !== undefined && typeof t.after === 'function') {
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+  }
   return { root, pkg, run };
 }
 
-test('四种 mode 都能打上，且第二遍是幂等的', () => {
-  const { pkg, run } = makeFixture();
+test('四种 mode 都能打上，且第二遍是幂等的', (t) => {
+  const { pkg, run } = makeFixture(t);
   const first = run();
   assert.equal(first.exitCode, 0, first.lines.join('\n'));
   assert.equal(readFileSync(join(pkg, 'lib', 'anchor.js'), 'utf8'), ANCHOR_PATCHED);
@@ -107,8 +116,8 @@ test('四种 mode 都能打上，且第二遍是幂等的', () => {
   assert.equal(readFileSync(join(pkg, 'lib', 'mixed.js'), 'utf8'), MIXED_PATCHED);
 });
 
-test('--check 不写盘，--revert 还原成原样并删掉新建文件', () => {
-  const { pkg, run } = makeFixture();
+test('--check 不写盘，--revert 还原成原样并删掉新建文件', (t) => {
+  const { pkg, run } = makeFixture(t);
   const dry = run(['--check']);
   assert.equal(dry.exitCode, 0, dry.lines.join('\n'));
   assert.equal(readFileSync(join(pkg, 'lib', 'anchor.js'), 'utf8'), ANCHOR_ORIGINAL);
@@ -124,8 +133,8 @@ test('--check 不写盘，--revert 还原成原样并删掉新建文件', () => 
   assert.equal(existsSync(join(pkg, '.phc-created.json')), false, '还原后清单也该清掉');
 });
 
-test('锚点失效时整体拒绝写盘（其它文件也不动）', () => {
-  const { pkg, run } = makeFixture();
+test('锚点失效时整体拒绝写盘（其它文件也不动）', (t) => {
+  const { pkg, run } = makeFixture(t);
   writeFileSync(join(pkg, 'lib', 'anchor.js'), ANCHOR_ORIGINAL.replace('const flag = false;', 'const flag = 0;'));
   const result = run();
   assert.equal(result.exitCode, 1);
@@ -135,8 +144,8 @@ test('锚点失效时整体拒绝写盘（其它文件也不动）', () => {
   assert.equal(existsSync(join(pkg, 'lib', 'created.js')), false);
 });
 
-test('整文件内容 sha256 不认识时拒绝覆盖，--force 才覆盖', () => {
-  const { pkg, run } = makeFixture();
+test('整文件内容 sha256 不认识时拒绝覆盖，--force 才覆盖', (t) => {
+  const { pkg, run } = makeFixture(t);
   writeFileSync(join(pkg, 'lib', 'whole.js'), 'export const whole = "someone else edited me";\n');
   const blocked = run();
   assert.equal(blocked.exitCode, 1);
@@ -147,8 +156,8 @@ test('整文件内容 sha256 不认识时拒绝覆盖，--force 才覆盖', () =
   assert.equal(readFileSync(join(pkg, 'lib', 'whole.js'), 'utf8'), WHOLE_PATCHED);
 });
 
-test('create 的目标已被别人占用时拒绝覆盖；--force 后才覆盖，且 --revert 会还原', () => {
-  const { pkg, run } = makeFixture();
+test('create 的目标已被别人占用时拒绝覆盖；--force 后才覆盖，且 --revert 会还原', (t) => {
+  const { pkg, run } = makeFixture(t);
   writeFileSync(join(pkg, 'lib', 'created.js'), 'export const created = "not ours";\n');
   const blocked = run();
   assert.equal(blocked.exitCode, 1);
@@ -163,8 +172,41 @@ test('create 的目标已被别人占用时拒绝覆盖；--force 后才覆盖�
   assert.equal(readFileSync(join(pkg, 'lib', 'created.js'), 'utf8'), 'export const created = "not ours";\n');
 });
 
-test('--json 输出可被解析，且 changed 按文件数计', () => {
-  const { run } = makeFixture();
+// ===== 真机回归：补丁**升级**后重打（资产内容变了，但文件是上一版自己建的）=====
+//
+// 2026-11-07 实际踩到：改了 `assets/rate-limit-resume.js` 之后 `sync-hashes` 换了
+// 哈希，再打补丁时守卫按「已存在且哈希对不上」直接拒绝，提示要用 `--force`。
+// 但那个文件明明是**本补丁自己**建的 —— 归属证据就写在 `.phc-created.json` 里，
+// 守卫却只查了「内容哈希是否等于**当前**资产」，等于要求用户每次改资产都手动 --force。
+// 正确判据：**清单里有它 = 我们的文件**，允许原地更新。
+test('补丁升级后重打：清单里登记过的 create 目标必须允许原地更新（不需要 --force）', (t) => {
+  const { root, pkg, run } = makeFixture(t);
+  // 第一版打上：此时清单登记了 lib/created.js。
+  assert.equal(run().exitCode, 0);
+  assert.equal(readFileSync(join(pkg, 'lib', 'created.js'), 'utf8'), CREATED_MODULE);
+
+  // 模拟「补丁升级」：资产内容与声明哈希一起换掉（与 sync-hashes 的效果一致）。
+  const upgraded = `${CREATED_MODULE}// v2\n`;
+  writeFileSync(join(root, 'assets', 'created.js'), upgraded);
+  const data = JSON.parse(readFileSync(join(root, 'patch-data.json'), 'utf8'));
+  const entry = data.files.find((file) => file.path === 'lib/created.js');
+  entry.patchedSha256 = sha256(upgraded);
+  writeFileSync(join(root, 'patch-data.json'), JSON.stringify(data, null, 2));
+
+  const second = run();
+  assert.equal(second.exitCode, 0, second.lines.join('\n'));
+  assert.equal(readFileSync(join(pkg, 'lib', 'created.js'), 'utf8'), upgraded);
+  // 升级覆盖时的动作必须是「更新」，不是再新建一次（否则清单与 revert 语义会乱）。
+  assert.match(second.lines.join('\n'), /更新（本补丁先前创建的文件）/);
+
+  // 还原语义：升级覆盖前把**上一版**存了备份 ⇒ `--revert` 退回那一版。
+  // （覆盖别人写的内容必须能撤回，覆盖自己的旧版本同理。）
+  assert.equal(run(['--revert']).exitCode, 0);
+  assert.equal(readFileSync(join(pkg, 'lib', 'created.js'), 'utf8'), CREATED_MODULE);
+});
+
+test('--json 输出可被解析，且 changed 按文件数计', (t) => {
+  const { run } = makeFixture(t);
   const result = run(['--json']);
   assert.equal(result.exitCode, 0, result.lines.join('\n'));
   assert.equal(result.report.ok, true);
@@ -172,7 +214,7 @@ test('--json 输出可被解析，且 changed 按文件数计', () => {
   assert.equal(result.report.changed, 4);
 });
 
-test('找不到目标包时抛参数错误（退出码 2）', () => {
+test('找不到目标包时抛参数错误（退出码 2）', (t) => {
   const root = mkdtempSync(join(tmpdir(), 'phc-empty-'));
   try {
     assert.throws(() => runPatch(['--dir', root]), (error) => {
@@ -187,8 +229,8 @@ test('找不到目标包时抛参数错误（退出码 2）', () => {
   }
 });
 
-test('资产哈希与 patch-data 声明不符时立刻拒绝（不写任何文件）', () => {
-  const { root, pkg, run } = makeFixture();
+test('资产哈希与 patch-data 声明不符时立刻拒绝（不写任何文件）', (t) => {
+  const { root, pkg, run } = makeFixture(t);
   const data = JSON.parse(readFileSync(join(root, 'patch-data.json'), 'utf8'));
   const target = data.files.find((file) => file.mode === 'create');
   target.patchedSha256 = '0'.repeat(64);
