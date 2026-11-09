@@ -2,11 +2,15 @@
 /**
  * dsh-providers-hub-enhance —— 给 `dsh-providers-hub` 打**增强补丁**（可重放、可还原、带守卫）。
  *
- * 目前补两件事：
+ * 目前补三件事：
  *
- * 1. **Raccoon（商汤小浣熊）每日签到**：上游「没有签到端点」是漏查，真正的触发器
+ * 1. **CodeBuddy（腾讯 `copilot.tencent.com`）出站守卫**：DSH 自己的提示词里有四段会被
+ *    国内网关判成「非授权渠道调用」（400 / code 11128），在 fetch 层做语义等价改写。
+ *    机制移植自 dsh-wb400-guard，只对 CodeBuddy 一个提供方生效（详见
+ *    `assets/codebuddy-guard.js` 的模块头）。
+ * 2. **Raccoon（商汤小浣熊）每日签到**：上游「没有签到端点」是漏查，真正的触发器
  *    在办公端（详见 docs/how-it-works.md）。
- * 2. **限流中断后的「解禁后自动继续」**：会话因限流（429 / 额度耗尽）中断时，
+ * 3. **限流中断后的「解禁后自动继续」**：会话因限流（429 / 额度耗尽）中断时，
  *    在报错行尾给一个可切换的图标按钮，等限流解禁后自动把会话续上；Jet Hub
  *    设置页顶部有一个总开关决定默认行为。
  *
@@ -540,7 +544,8 @@ export function runPatch(argv, options = {}) {
   log('生效方式（宿主侧模块在启动时加载，必须重启进程）：');
   log('  1. 自己重启 DSH；');
   log('  2. 重启后刷新页面：Raccoon 卡片上出现「一键领取积分」，');
-  log('     限流中断的报错行尾出现「解禁后自动继续」图标按钮。');
+  log('     限流中断的报错行尾出现「解禁后自动继续」图标按钮；');
+  log('  3. 走 CodeBuddy（buddy）时不再撞 400/11128 —— 想确认就先跑 `node scripts/verify-guard.mjs`。');
   return { exitCode: 0, report: { ...report, changed: pending.length }, lines };
 }
 

@@ -14,8 +14,10 @@ const targets = [
   "patch.mjs",
   "assets/rate-limit-resume.js",
   "assets/client-rate-limit-resume.js",
+  "assets/codebuddy-guard.js",
   "scripts/sync-hashes.mjs",
   "scripts/ci-syntax-check.mjs",
+  "scripts/verify-guard.mjs",
 ];
 
 let failed = 0;

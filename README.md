@@ -2,10 +2,11 @@
 
 给 [dsh-providers-hub](https://www.npmjs.com/package/dsh-providers-hub) 打**增强补丁** —— 可重放、可还原、带守卫。
 
-目前补两件事：
+目前补三件事：
 
 | 能力 | 一句话 |
 |---|---|
+| **CodeBuddy 出站守卫** | 腾讯国内网关的 `400 / 11128` 不再拦 DSH 的提示词；只对 `copilot.tencent.com` 生效，别的渠道一字节不碰 |
 | **Raccoon 每日签到** | 顺带把上游漏掉的**手机端登录奖励 +3000 积分**也打回来 |
 | **限流中断后「解禁后自动继续」** | 会话因 429 / 额度耗尽中断时，报错行尾给一个可切换的图标按钮，解禁后自动续上；Jet Hub 设置页顶部有默认开关 |
 
@@ -22,7 +23,80 @@ node patch.mjs --revert # 还原
 
 ---
 
-## 1. 限流中断后「解禁后自动继续」
+## 1. CodeBuddy 出站守卫（400 / 11128）
+
+走 buddy（CodeBuddy 中国版）时每轮第一步就挂，报文是：
+
+```
+本轮运行失败 400: ... code 11128 / "Illegal API invocation from an unapproved channel"
+```
+
+腾讯国内网关在服务端对 system / assistant 消息做通道校验。**触发规则的来源有四个，互不相关**，
+而 DSH 默认四段全带着：
+
+| # | 指纹 | 出处（DSH 内核） | 网关拦在哪 |
+|---|---|---|---|
+| 1 | `Tokens prefixed with @ are paths the user explicitly referenced…` | `@deepseek-ai/dsh-file-reference` | **任意位置**（system 与 assistant 都拦） |
+| 2 | `You are an AI agent powered by DeepSeek⁻Harness.` | `@deepseek-ai/dsh-system-prompt` | **仅消息开头** |
+| 3 | `You are a coding agent powered by {model} model.` | `@deepseek-ai/dsh-web-app` 的 `personaPrefix` | 句式 `coding agent powered by` |
+| 4 | `You are interacting with the user through the DeepSeek⁻Harness Web GUI…` / `Current DeepSeek⁻Harness Web GUI URL` | `@deepseek-ai/dsh-harness-dev-context` | 同上（在 system 尾部） |
+
+（`⁻` 是内核原文里的零宽空格 U+200B。）只修其中一段，其余几段照样 400 —— 这不是推理，
+是 dsh-wb400-guard 对真实网关逐项 A/B 打出来的结论，本补丁把那套机制整条移植了过来。
+
+**做法**：在宿主进程里包一层 `globalThis.fetch`，只对发往 `copilot.tencent.com` 的请求、
+只对 `system` / `developer` / `assistant` 三条角色的 content 做**语义等价**改写：
+
+| # | 改什么 | 改成什么 |
+|---|---|---|
+| 1 | 文件引用段里的 `@` | 等义写法 `(at)` |
+| 2 | 开头的身份句 | `DeepSeek⁻Harness` → `DeepSeek-Harness`（零宽空格改连字符） |
+| 3 | `coding agent powered by` | `coding agent running on`（模型名原样保留） |
+| 4 | Web GUI 两句 | `… through this Web GUI` / `Current Web GUI URL` |
+
+最后兜底把任何残留的 `DeepSeek` + 不可见分隔 + `Harness` 品牌指纹统一换成连字符写法。
+
+**安全边界**（每条都有用例锁住）：
+
+- **只改受防护 host**：别家 API（DeepSeek 官方、Raccoon、WorkBuddy 国际版…）**连对象引用都原样透传**；
+- **只改 system / developer / assistant**：`user` 与 `tool` 里写的邮箱 `a@b.com`、`@某人`、代码里的
+  here-string、正则，一个字符都不碰；
+- **幂等**：第二遍改写不再变动，未改动时返回入参原引用；
+- **fail-open**：改写链路任何异常都退回原始请求，不阻断对话、不引入重试；
+- **剔掉陈旧的 `Content-Length`**（body 变短后还带旧长度，上游会按旧长度截断）；
+- **不落盘、不上报**：日志里的 URL 只留 origin + path，查询串（可能带 `prompt_cache_key`、token）一律剥离；
+- **只装一层**：`Symbol.for` 保证重复安装不会叠成两层守卫。
+
+开关（改环境变量即可，**不用重打补丁**）：
+
+| 环境变量 | 值 | 说明 |
+|---|---|---|
+| `DSH_CODEBUDDY_GUARD` | `off` | 完全不碰 fetch |
+| | `dryrun` | 只观测：一个字节都不改，命中只记 `would-rewrite`（排障用） |
+| | `all` | 扫描角色里的所有 `@` 都换成 `(at)`（内核改了措辞时的兜底） |
+| `DSH_CODEBUDDY_GUARD_MODE` | `anchor` / `all` | 同上 |
+| `DSH_CODEBUDDY_GUARD_HOSTS` | 逗号分隔 | 追加 host，以 `.` 开头做后缀匹配（例如 `.workbuddy.ai`） |
+| `DSH_CODEBUDDY_GUARD_LOG` | 路径 | 覆盖日志位置 |
+
+日志默认 `<DSH_HOME>/jet-hub/codebuddy-guard.jsonl`（与 `rate-limit-resume.json` 同目录）。
+
+**怎么确认它在工作**：
+
+```bash
+npm run verify            # 或 node scripts/verify-guard.mjs
+```
+
+它会依次回答三件事：补丁的接线在不在（`index.js` 有没有装、`buddy-adapter.js` 有没有包）、
+真模块能不能把四段指纹改写掉、守卫能不能装上并还原。不发网络请求。
+
+想抓「到底哪一句会被拦」，把它设成只观测模式再发一条消息：
+
+```powershell
+$env:DSH_CODEBUDDY_GUARD = 'dryrun'   # 重启 DSH 后生效
+Get-Content "$env:USERPROFILE\.dsh\jet-hub\codebuddy-guard.jsonl" -Tail 20
+```
+
+## 2. 限流中断后「解禁后自动继续」
 
 被 429 / 额度耗尽打断的回合，宿主会把会话停在「本轮运行失败」。这类失败**等一会儿就会自愈**，但没人替你去点「继续」—— 于是任务就停在那儿了。
 
@@ -43,7 +117,7 @@ node patch.mjs --revert # 还原
 - **什么情况下放弃**：会话已不在内存（`no-live-agent`）、用户手动发了消息、宿主自己开了新回合，或反复投递失败。
 - **续跑消息不冒充用户**：它带自己的来源标识 `rate-limit-resume`，**绝不**写成 `source.kind === 'user'`（那是宿主对「直接人类输入」的证明，`tool-goal` 等工具据此授权）。
 
-## 2. Raccoon（商汤小浣熊）每日签到
+## 3. Raccoon（商汤小浣熊）每日签到
 
 上游当前（以及 2.13.x 最新版）的结论是：
 
@@ -121,8 +195,10 @@ node patch.mjs
 
 | 文件 | 改动 |
 |---|---|
+| `lib/codebuddy-guard.js` | **新建**：fetch 层守卫（四段指纹改写 / host 过滤 / 幂等 / fail-open / dryRun / JSONL 日志 / 单例安装） |
+| `lib/index.js` | `apply()` **最前面**装 `installCodeBuddyGuard(ctx)`；另装上 `installRateLimitResume(ctx, pool)` |
+| `lib/buddy-adapter.js` | 构造改走 `guardCodeBuddyFetch(options.fetchImpl ?? fetch)`（兜住加载顺序） |
 | `lib/rate-limit-resume.js` | **新建**：限流判据、解禁时刻推算、待续跑钩子（含落盘与恢复）、`agent.followup` 投递 |
-| `lib/index.js` | `apply()` 里装上 `installRateLimitResume(ctx, pool)` |
 | `lib/jet-hub-rpc.js` | 三条端点 `resume.getState` / `resume.setArmed` / `resume.setEnabled` |
 | `lib/client/jet-hub.js` | 报错行尾图标按钮（DOM 增强）+ 设置页顶部默认开关 |
 | `lib/raccoon-credits.js` | 新增 `claimRaccoonDailyCheckin` / `triggerRaccoonDailyGrant` / `fetchRaccoonTodayGrants`；登录奖励两端合并；状态改走 v2 income 账单 |
@@ -132,6 +208,25 @@ node patch.mjs
 | `lib/provider-registry.js` | 能力表登记 `dailyCheckin: true`，面板才会渲染签到按钮 |
 
 ## 常见问题
+
+**守卫会不会影响我别的渠道（Raccoon / DeepSeek 官方 / 国际版）？**
+不会。只有 host 命中 `copilot.tencent.com` 的请求才会被看；别家请求原样透传同一个对象引用，
+连序列化都不重做。
+
+**会不会改坏我的对话？**
+只动 system / developer / assistant，且只动那四处指纹。user 消息、工具输出、代码里的
+`@` 与邮箱都不碰。改动都是语义等价的措辞变化。
+
+**守卫会不会和 dsh-wb400-guard 打架？**
+不会。两个都是「只对 `copilot.tencent.com`、只改那四段指纹」的同一套改写，各自幂等：
+先装的那层改完，后装的那层扫一遍发现无指纹可改就原样放过（`stats.passedThrough` +1）。
+本补丁的价值在于**不依赖它**：没装 wb400-guard 时 CodeBuddy 同样是通的；装了则是双保险。
+
+**升级 providers-hub 之后守卫就没了？**
+对 —— 补丁改的是 `node_modules`，升级会整个换掉。重跑一次 `node patch.mjs` 再重启即可。
+
+**守卫上写着「UI 里没有开关」？**
+它按环境变量开关（见上面那张表），刻意不占 Jet Hub 设置页的版面：默认就该是开的。
 
 **勾了「解禁后自动继续」，按钮过一会儿自己消失了？**
 那是正常的：宿主在解禁时刻投递成功后就把记录清掉了（点下去已经没有意义，留着只会误导）。另外你自己发了一条消息、或宿主开了新回合，也会撤掉它。

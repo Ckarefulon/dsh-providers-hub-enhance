@@ -158,6 +158,67 @@
       ]
     },
     {
+      "path": "lib/codebuddy-guard.js",
+      "mode": "create",
+      "asset": "assets/codebuddy-guard.js",
+      "patchedSha256": "01b880f067775420f597f0578c193de50f670dee502aa7de7d661247e5670328"
+    },
+    {
+      "path": "lib/buddy-adapter.js",
+      "mode": "anchor",
+      "edits": [
+        {
+          "find": [
+            "import { rewriteTencentContentFingerprints } from './openai-gateway/tencent-fingerprint.js';"
+          ],
+          "replace": [
+            "import { rewriteTencentContentFingerprints } from './openai-gateway/tencent-fingerprint.js';",
+            "import { guardCodeBuddyFetch } from './codebuddy-guard.js';"
+          ]
+        },
+        {
+          "find": [
+            "        this.fetchImpl = options.fetchImpl ?? fetch;"
+          ],
+          "replace": [
+            "        // ⚠️ 本补丁：CodeBuddy 出站守卫（见 `codebuddy-guard.js`）。",
+            "        //    适配器在**构造这一刻**就把 `fetch` 存进了实例，若守卫晚于构造装上，",
+            "        //    只包全局 fetch 是**盖不到**这个实例的 —— 故这里再包一层（幂等，WeakMap 记忆化）。",
+            "        this.fetchImpl = guardCodeBuddyFetch(options.fetchImpl ?? fetch);"
+          ]
+        }
+      ]
+    },
+    {
+      "path": "lib/index.js",
+      "mode": "anchor",
+      "edits": [
+        {
+          "find": [
+            "import { installWebNative } from './web-native.js';"
+          ],
+          "replace": [
+            "import { installWebNative } from './web-native.js';",
+            "import { installCodeBuddyGuard } from './codebuddy-guard.js';"
+          ]
+        },
+        {
+          "find": [
+            "export function apply(ctx) {",
+            "    // 本插件自带 Jet Hub 设置页，关闭 0.1.7 起由 Config schema 反渲染的自动表单"
+          ],
+          "replace": [
+            "export function apply(ctx) {",
+            "    // ⚠️ 本补丁：**必须放在最前面**。本函数稍后会 `registerBuddyLlm()`，而 BuddyAdapter",
+            "    //    构造时就捕获 `fetch` 引用；守卫晚一步装，那个实例就绕过了守卫。",
+            "    //    作用域：只对 `copilot.tencent.com`（CodeBuddy）生效，别的渠道一字节不碰。",
+            "    installCodeBuddyGuard(ctx);",
+            "    // 本插件自带 Jet Hub 设置页，关闭 0.1.7 起由 Config schema 反渲染的自动表单"
+          ]
+        }
+      ]
+    },
+    {
       "path": "lib/rate-limit-resume.js",
       "mode": "create",
       "asset": "assets/rate-limit-resume.js",

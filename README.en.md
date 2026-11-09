@@ -6,6 +6,7 @@ descriptions, not patched files: after every plugin upgrade, run it again.
 
 | Capability | Summary |
 |---|---|
+| **CodeBuddy fetch guard** | DeepSeek Harness' own prompt text trips Tencent's domestic gateway (`400 / 11128`); the guard rewrites four fingerprints at the fetch layer — for `copilot.tencent.com` only |
 | **Raccoon daily check-in** | Also claims the **mobile login reward (+3000 credits)** upstream never implemented |
 | **Resume after rate limiting** | When a turn dies on 429 / exhausted quota, a toggleable icon button appears on the error row and resumes the turn once the limit lifts; a switch in Jet Hub settings decides the default |
 
@@ -19,7 +20,57 @@ node patch.mjs --revert # undo
 > Restart DeepSeek Harness after patching (host modules load at process start),
 > then refresh the page.
 
-## 1. Resume after rate limiting
+## 1. CodeBuddy fetch guard (400 / 11128)
+
+Talking to buddy (CodeBuddy, China) fails on the very first step with
+
+```
+400 ... code 11128 / "Illegal API invocation from an unapproved channel"
+```
+
+The gateway validates system / assistant content server-side. **DSH ships four of the
+matching fingerprints by default**, and they are independent — fixing one does not help:
+
+| # | Fingerprint | Where it comes from | Where it trips |
+|---|---|---|---|
+| 1 | `Tokens prefixed with @ are paths the user explicitly referenced…` | `@deepseek-ai/dsh-file-reference` | **any position** (system and assistant) |
+| 2 | `You are an AI agent powered by DeepSeek⁻Harness.` | `@deepseek-ai/dsh-system-prompt` | **message start only** |
+| 3 | `You are a coding agent powered by {model} model.` | `@deepseek-ai/dsh-web-app` (`personaPrefix`) | the `coding agent powered by` shape |
+| 4 | `You are interacting with the user through the DeepSeek⁻Harness Web GUI…` / `Current DeepSeek⁻Harness Web GUI URL` | `@deepseek-ai/dsh-harness-dev-context` | same (at the system prompt's tail) |
+
+(`⁻` is U+200B as shipped by the kernel.) The mechanism is ported wholesale from
+[dsh-wb400-guard](https://github.com/curo22/dsh-wb400-guard), which established every row
+by A/B testing the real gateway.
+
+**What it does**: wraps `globalThis.fetch`, and for requests to `copilot.tencent.com` only,
+rewrites `system` / `developer` / `assistant` content semantically:
+
+1. the `@` inside the file-reference paragraph → `(at)`;
+2. the leading identity sentence → `DeepSeek-Harness`;
+3. `You are a coding agent powered by` → `running on` (model name preserved);
+4. the two Web GUI sentences → `… through this Web GUI` / `Current Web GUI URL`;
+
+plus a final pass that normalizes any leftover `DeepSeek` + invisible separator + `Harness`.
+
+Guarantees (each one covered by a test): other hosts pass through **the same object
+reference** untouched; `user` and `tool` messages are never modified; idempotent; fail-open;
+stale `Content-Length` dropped; single install layer (`Symbol.for`); logs keep only
+origin + path.
+
+Switches (environment variables, no re-patching needed): `DSH_CODEBUDDY_GUARD=off|dryrun|all`,
+`DSH_CODEBUDDY_GUARD_MODE=anchor|all`, `DSH_CODEBUDDY_GUARD_HOSTS=.workbuddy.ai,…`,
+`DSH_CODEBUDDY_GUARD_LOG=<path>`. Logs default to
+`<DSH_HOME>/jet-hub/codebuddy-guard.jsonl`.
+
+Run `npm run verify` to answer "is the guard working right now" (wiring, real module
+round-trip, install/uninstall). It makes no network requests.
+
+It coexists with [dsh-wb400-guard](https://github.com/curo22/dsh-wb400-guard): both rewrite
+the same four fingerprints on the same host, both are idempotent, so whichever layer runs
+first wins and the other passes the request through unchanged. This patch does not depend
+on that plugin being installed.
+
+## 2. Resume after rate limiting
 
 A turn interrupted by 429 / exhausted quota heals by itself — but nobody presses
 "continue" for you, so the task simply stops. This patch adds:
@@ -53,7 +104,7 @@ Judgement and trade-offs:
   `rate-limit-resume` and is **never** written as `source.kind === 'user'` (that is
   the host's proof of direct human input, which `tool-goal` and friends rely on).
 
-## 2. Raccoon daily check-in
+## 3. Raccoon daily check-in
 
 Upstream states Raccoon has no check-in endpoint. That conclusion comes from only probing
 `/api/web/points/v1|v2` (where `sign_in` / `check_in` / `daily` / `claim` are indeed 404).

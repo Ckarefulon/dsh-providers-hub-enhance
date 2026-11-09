@@ -87,7 +87,9 @@ GET /api/web/points/v2/bills?paging.limit=100&type=income
 | `lib/provider-credits.js` | Raccoon 的 `claim` 实现（替换 `claimUnavailableReason`） |
 | `lib/provider-registry.js` / `lib/client/jet-hub.js` | `credits.dailyCheckin: true`（面板才会渲染签到按钮） |
 | `lib/rate-limit-resume.js` | **新建**：限流判据、解禁时刻推算、待续跑钩子（落盘 + 恢复）、`agent.followup` 投递 |
-| `lib/index.js` | `installRateLimitResume(ctx, pool)`（与 `installLoopResume` 并列，管的是不同失败类） |
+| `lib/codebuddy-guard.js` | **新建**：CodeBuddy 出站守卫（fetch 层四段指纹改写，见 §9） |
+| `lib/buddy-adapter.js` | 构造改走 `guardCodeBuddyFetch(options.fetchImpl ?? fetch)` |
+| `lib/index.js` | `installCodeBuddyGuard(ctx)`（放在 `apply()` 最前面）+ `installRateLimitResume(ctx, pool)`（与 `installLoopResume` 并列，管的是不同失败类） |
 | `lib/jet-hub-rpc.js` | 三条端点 `resume.getState` / `resume.setArmed` / `resume.setEnabled` |
 | `lib/client/jet-hub.js` | 报错行尾图标按钮（DOM 增强）+ 设置页顶部默认开关 |
 
@@ -166,3 +168,95 @@ tmp+rename 惯例），启动时恢复，恢复时丢弃无效 / 过旧记录。
   存在性只能靠客户端 bundle / 文档确认。
 - `raw.githubusercontent.com` 在某些网络（含本项目作者的开发机）会被 SNI 阻断，
   取仓库文件改用 `git/trees` + `git/blobs` 接口更稳。
+
+## 9. CodeBuddy 出站守卫（400 / code 11128）
+
+### 现象
+
+走 buddy（CodeBuddy 中国版，`copilot.tencent.com`）时**每轮第一步**就挂：
+
+```
+400 {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}
+```
+
+插件把这条包成「请求被拦截，请重新发送」，标签 `INVALID_REQUEST`。换账号、换模型、
+换机器都一样；WorkBuddy 国际版（`www.workbuddy.ai`）不校验。
+
+### 四段指纹（互不相关，必须一起修）
+
+| # | 指纹 | 内核出处 | 位置语义 |
+|---|---|---|---|
+| 1 | `Tokens prefixed with @ are paths the user explicitly referenced…` | `@deepseek-ai/dsh-file-reference` | **位置无关**；assistant 里也拦，而且连前导空格 / tab / 换行 / BOM 都绕不过 |
+| 2 | `You are an AI agent powered by DeepSeek\u200B Harness.` | `@deepseek-ai/dsh-system-prompt`（`includeHarnessIdentity`） | **仅消息开头**（前垫一整行能过、垫空格或 BOM 不能过） |
+| 3 | `You are a coding agent powered by {model} model.` | `@deepseek-ai/dsh-web-app` 的 `personaPrefix` | 句式 `coding agent powered by`（换模型名救不了） |
+| 4 | `You are interacting with the user through the DeepSeek\u200B Harness Web GUI…` / `Current DeepSeek\u200B Harness Web GUI URL` | `@deepseek-ai/dsh-harness-dev-context` | 在 system **尾部**，只做「开头锚定」的修法完全够不到 |
+
+上表的**取证强度**要如实分开写：
+
+- 四段的位置语义与「改写后放行」是 [dsh-wb400-guard](https://github.com/curo22/dsh-wb400-guard)
+  在真实网关上逐项 A/B 打出来的（同账号同请求头，只换 body 里的 system 文本，
+  含逐词删词消融）；
+- 本机 2026-11-07 的**活** system prompt 里四段**全在**（`tests/codebuddy-guard.test.mjs`
+  逐字断言，不是从文档转抄的常量）；
+- **本补丁没有**在本机对 `copilot.tencent.com` 做 A/B（那需要真实 buddy 凭据）。
+  故「改写后不再 400」这条结论借的是上游的实测，我们这边能证的是「改写确实发生了、
+  范围与语义都对」。
+
+### 为什么落在 fetch 层
+
+上游自己已经有一层 `lib/openai-gateway/tencent-fingerprint.js`（表驱动），但它是
+**按调用点**接入的（`serializeMessages` + `options.system`），管的是 ZCode / Claude Code
+的两条客户端模板句 —— 与上面四段**不重叠**。而且按调用点接入意味着每新增一条出站路径
+就要再补一次：上游自己在那个文件的注释里把 `buddy-growth.ts` 的两处直发 POST 登记成
+「第三个未改写入口」，承认漏一处就是整轮 400。
+
+fetch 同时满足三件事：**精准**（按 host 过滤，别家原样透传）、**不漏**（不管从哪个函数
+发出去）、**盖得住重试阶梯**（`stream()` 内部的换号 / 限流 / 策略拦截每一级都重新发请求，
+在 body 组装层改写会漏掉其中几级）。
+
+### 为什么还要包适配器实例
+
+`BuddyAdapter` 的构造函数里是 `this.fetchImpl = options.fetchImpl ?? fetch` ——
+`fetch` 在**构造那一刻**就被求值并存进实例。若插件加载顺序让守卫晚于构造装上，
+只包 `globalThis.fetch` 是**盖不到**这个实例的。故补丁同时改构造：
+
+```js
+this.fetchImpl = guardCodeBuddyFetch(options.fetchImpl ?? fetch);
+```
+
+`guardCodeBuddyFetch` 用 WeakMap 记忆化，并且当 `inner` 已经是装好的全局守卫时**直接返回
+它** —— 两条接线重叠也不会叠成两层（两层会双倍改写 + 双倍日志，`--check` 看不出来，
+只有日志里出现两条 `rewritten` 才暴露）。
+
+### 语义与安全边界
+
+| 约束 | 原因 |
+|---|---|
+| 只改 `system` / `developer` / `assistant` | `user` 是用户原话、`tool` 是回读给模型看的证据，实测网关也不拦它们 |
+| `@` 只改**整段**文件引用里的，不做「见到 @ 就换」 | 裸 `@"`（PowerShell here-string / C# 逐字字符串）实测完全不触发；兜底只会把用户代码静默改坏 |
+| 身份句只在**开头**改写 | 句中 / 尾部不拦，改了只是白改用户内容 |
+| 幂等 | `rewrite(rewrite(x)) === rewrite(x)`；未改动时返回入参原引用（省掉不必要的重序列化） |
+| fail-open | 改写链路任何异常都退回原请求；守卫**绝不**引入重试，也**不吞**网络错误 |
+| 剔掉陈旧的 `Content-Length` | body 变短后还带旧长度，上游会按旧长度截断 |
+| 只装一层（`Symbol.for`） | 后装的在外层会吞掉先装的日志与卸载 |
+| 日志只留 origin + path | 查询串可能带 `prompt_cache_key` / token |
+
+### 前缀缓存
+
+改写是**确定性**的，每一轮对同一段文本产出同一份字节，故服务端前缀缓存只在「装上守卫
+之前 vs 之后」那一次 miss，之后照旧命中。这也是为什么 `mode` 默认是 `anchor`
+（只动四处）而不是 `all`（把所有 `@` 都换）—— 后者会让「用户改了一个 `@`」之类的
+微妙差异变多，白丢缓存。
+
+### 怎么验证
+
+```bash
+node scripts/verify-guard.mjs
+```
+
+三层：接线（`index.js` 装了没、`buddy-adapter.js` 包了没、模块在不在）→ 模块（真 import，
+跑一遍四段改写 + 幂等 + host 作用域）→ 安装（假 ctx 上装一次，确认 `globalThis.fetch`
+被替换、`ctx.effect` 拿到卸载函数、卸载后还原）。**不发网络请求**。
+
+想看「到底哪一句会触发」，设 `DSH_CODEBUDDY_GUARD=dryrun` 再发一条消息，然后读
+`$DSH_HOME/jet-hub/codebuddy-guard.jsonl` 里的 `would-rewrite` 记录。

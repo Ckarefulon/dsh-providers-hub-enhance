@@ -1,5 +1,58 @@
 # 更新记录
 
+## 1.2.0 — 2026-11-07
+
+**新增第三项能力：CodeBuddy（腾讯 `copilot.tencent.com`）出站守卫**。机制整条移植自
+[dsh-wb400-guard](https://github.com/curo22/dsh-wb400-guard) 的 fetch 层守卫，但**只对
+CodeBuddy 一个提供方生效**（别家渠道的请求连对象引用都原样透传）。
+
+要解决的现象：走 buddy 时每轮第一步就挂，报文是
+
+```
+本轮运行失败 400: ... code 11128 / "Illegal API invocation from an unapproved channel"
+```
+
+网关在服务端对 system / assistant 消息做通道校验，而 DSH 自己的提示词里**默认带着四段**
+指纹（文件引用段里的 `@`、内核身份句、`personaPrefix` 的 coding agent 句、Web GUI 两段）。
+四段互不相关，改一段救不了另外三段 —— 实测 2026-11-07 的本机提示词**四段全在**。
+
+为什么不用上游已有的那层改写：`lib/openai-gateway/tencent-fingerprint.js` 是**按调用点**
+接入的（`serializeMessages` 与 `options.system`），它管的是 ZCode / Claude Code 的客户端
+模板句，与我们这四段不重叠；而且每新增一条出站路径就要再补一次（上游自己在文档里把这
+条教训写成了「第三个未改写入口」）。故这里落在 **fetch 层**：
+
+- 精准（按 host 过滤）、不漏（不管从哪个函数发出去）、盖得住 `stream()` 内部的换号重试阶梯；
+- 只改 `system` / `developer` / `assistant` 的 content，`user` 与 `tool` 一个字不动；
+- **幂等**（`rewrite(rewrite(x)) === rewrite(x)`，未改动返回入参原引用）；
+- **fail-open**（改写链路任何异常都退回原请求，绝不阻断对话、不引入重试）；
+- 改动后**剔除陈旧的 `Content-Length`**；
+- 全局只装**一层**（`Symbol.for`），卸载挂 `ctx.effect`；
+- 日志只记 origin + path（剥掉 query 里的 `prompt_cache_key` / token），落在
+  `$DSH_HOME/jet-hub/codebuddy-guard.jsonl`。
+
+接线两处（缺一不可）：
+
+1. `lib/index.js` 的 `apply()` **最前面**装全局守卫 —— 本函数稍后会 `registerBuddyLlm()`，
+   而 `BuddyAdapter` 在**构造那一刻**就把 `fetch` 存进了实例，晚一步装就盖不到它；
+2. `lib/buddy-adapter.js` 的构造改走 `guardCodeBuddyFetch(options.fetchImpl ?? fetch)` ——
+   兜住「插件加载顺序让守卫晚于构造」这种情形（同一份 fetch 只包一层，WeakMap 记忆化）。
+
+开关（改环境变量即可，不用重打补丁）：
+
+| 环境变量 | 值 | 说明 |
+|---|---|---|
+| `DSH_CODEBUDDY_GUARD` | `off` | 完全不碰 fetch |
+| | `dryrun` | 只观测：一个字节都不改，命中只记 `would-rewrite` |
+| | `all` | 扫描角色里的 `@` 全换（内核改了措辞时的兜底） |
+| `DSH_CODEBUDDY_GUARD_HOSTS` | 逗号分隔 | 追加 host，以 `.` 开头做后缀匹配（如 `.workbuddy.ai`） |
+| `DSH_CODEBUDDY_GUARD_LOG` | 路径 | 覆盖日志位置 |
+
+新增 `scripts/verify-guard.mjs`（`npm run verify`）：一条命令回答「守卫此刻在不在工作」——
+查接线、import 真模块跑四段改写、在假 ctx 上装一次再卸掉。它**不发网络请求**。
+
+测试：65 条（补丁器 9 / 宿主引擎 21 / 客户端 5 / 语法 6 / 新守卫 24），全绿。守卫用例里的
+四段指纹是**逐字抄自本机活的 DSH system prompt**，不是从别人文档转抄的常量。
+
 ## 1.1.1 — 2026-11-07
 
 **修三个真机上「功能等于没装」的缺陷**。报障原话：「除了设置里多了个按钮，报错后没有我说的

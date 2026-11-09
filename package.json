@@ -1,7 +1,7 @@
 {
   "name": "dsh-providers-hub-enhance",
-  "version": "1.1.1",
-  "description": "给 dsh-providers-hub 打增强补丁：Raccoon（商汤小浣熊）每日签到 + 限流中断后的「解禁后自动继续」。可重放、可还原、带守卫的 node_modules 补丁器",
+  "version": "1.2.0",
+  "description": "给 dsh-providers-hub 打增强补丁：CodeBuddy 出站守卫（11128 不再拦）+ Raccoon（商汤小浣熊）每日签到 + 限流中断后的「解禁后自动继续」。可重放、可还原、带守卫的 node_modules 补丁器",
   "type": "module",
   "bin": {
     "dsh-providers-hub-enhance": "./patch.mjs"
@@ -27,7 +27,8 @@
     "check": "node patch.mjs --check",
     "revert": "node patch.mjs --revert",
     "sync-hashes": "node scripts/sync-hashes.mjs",
-    "test": "node --experimental-vm-modules tests/patch.test.mjs && node tests/rate-limit-resume.test.mjs && node tests/client-rate-limit.test.mjs && node --experimental-vm-modules tests/syntax-check.test.mjs"
+    "verify": "node scripts/verify-guard.mjs",
+    "test": "node --experimental-vm-modules tests/patch.test.mjs && node tests/rate-limit-resume.test.mjs && node tests/client-rate-limit.test.mjs && node tests/codebuddy-guard.test.mjs && node --experimental-vm-modules tests/syntax-check.test.mjs"
   },
   "engines": {
     "node": ">=18"
@@ -36,6 +37,12 @@
     "dsh",
     "deepseek-harness",
     "dsh-providers-hub",
+    "codebuddy",
+    "workbuddy",
+    "tencent",
+    "11128",
+    "fetch-guard",
+    "dsh-wb400-guard",
     "raccoon",
     "sensetime",
     "xiaohuanxiong",
