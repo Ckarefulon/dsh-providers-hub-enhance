@@ -9,7 +9,14 @@
 // | 形态 | 判据 | 判别力 |
 // |---|---|---|
 // | **CJS**（客户端 bundle：顶层是 `window.__ModuleLoader__.load(...)`） | `vm.compileFunction`（只编译不执行） | **完整**：V8 真编译 |
-// | **ESM**（宿主模块 / `patch.mjs`：顶层有 `import`/`export`） | ① 有 `vm.SourceTextModule`（需 `--experimental-vm-modules`）⇒ 真解析；② 否则「挖掉 ESM 语句 + `compileFunction`」 | ① 完整；② **近似**（见下） |
+// | **ESM**（宿主模块 / `patch.mjs`：顶层有 `import`/`export`） | ① 有 `vm.SourceTextModule`（需 `--experimental-vm-modules`）⇒ 真解析；② 否则「挖掉 ESM 语句 + 包进 async 箭头函数 + `compileFunction`」 | ① 完整；② **近似**（见下） |
+//
+// ⚠️ 兜底路径（②）为什么要把残余体包进 `async () => { … }`：ESM 允许**顶层 await**
+// （`const x = await import('node:fs')`），而脚本的函数体不允许。直接编译残余体会把
+// 合法的顶层 await 误报成「await is only valid in async functions」——
+// Node 18 上 CI 就是这样红的（那条分支没有 `--experimental-vm-modules`，
+// 走的是纯退化判据）。包一层 async 箭头恰好只放行「顶层 await」这一条 ESM 差异：
+// 非 async 函数里的 await 仍然报错。
 //
 // ## ⚠️ 兜底路径（②）的已知盲区，如实登记
 //
@@ -145,6 +152,16 @@ export function stripEsmSyntax(source) {
   let out = '';
   let i = 0;
   const blank = (from, to) => source.slice(from, to).replace(/[^\n]/g, ' ');
+  // ⚠️ shebang 必须最先挖掉。ESM 允许源码**第 0 位**的 `#!`，但退化判据会把残余体
+  // 包进 `async () => { … }`，于是 `#!` 落到函数体中间 ⇒ 「Invalid or unexpected token」。
+  // （`node --check` 与 `SourceTextModule` 都只认「源文本开头」这一个位置，所以只有
+  //  退化判据会中招 —— `scripts/verify-guard.mjs` 与 `patch.mjs` 都带 shebang。）
+  if (masked.startsWith('#!')) {
+    const lineEnd = source.indexOf('\n');
+    const stop = lineEnd < 0 ? source.length : lineEnd;
+    out += blank(0, stop);
+    i = stop;
+  }
   while (i < source.length) {
     // 只在**行首**认语句起点：避免把正文 / 注释里的 `export` 字样挖掉。
     //
@@ -194,12 +211,13 @@ export function stripEsmSyntax(source) {
  * 检查一份源码的语法。
  *
  * @param source - 源码。
- * @param options - `{ form: 'cjs' | 'esm' }`。
+ * @param options - `{ form: 'cjs' | 'esm' }`；`degraded: true` 强制走退化判据
+ *   （等价于 Node 18 上 `vm.SourceTextModule` 不存在的情形，供测试直接覆盖）。
  * @returns `{ ok: true }` / `{ ok: false, message }`。
  */
 export function checkSyntax(source, options = {}) {
   if (options.form === 'esm') {
-    if (typeof vm.SourceTextModule === 'function') {
+    if (options.degraded !== true && typeof vm.SourceTextModule === 'function') {
       try {
         // 只构造：真的走 V8 的 ESM 解析器，不 link、不执行。
         new vm.SourceTextModule(source, { identifier: 'probe.mjs' });
@@ -209,8 +227,19 @@ export function checkSyntax(source, options = {}) {
         return { ok: false, message: `${error.name}: ${error.message}` };
       }
     }
+    // ⚠️ 退化判据必须把源码当成**异步箭头函数的函数体**再编译。
+    //
+    // 理由：ESM 允许**顶层 await**（`const x = await import(...)`），而脚本函数体不允许。
+    // 早期直接 `compileFunction(…)` 于是把合法的顶层 await 误报成
+    // 「await is only valid in async functions」—— Node 18 上 CI 就是这么红的
+    // （那条分支没有 `--experimental-vm-modules`，走的全是退化判据）。
+    // 包一层 async IIFE 恰好只放行「顶层 await」这一条 ESM 差异：
+    // 非 async 函数里的 await 仍然报错，其余语法错误照旧被抓到。
     try {
-      vm.compileFunction(withScriptSafeSubstitutions(stripEsmSyntax(source)), []);
+      vm.compileFunction(
+        withScriptSafeSubstitutions(`return (async () => {${stripEsmSyntax(source)}\n})`),
+        [],
+      );
       return { ok: true, approximate: true };
     }
     catch (error) {
@@ -227,24 +256,43 @@ export function checkSyntax(source, options = {}) {
 }
 
 /**
+ * 生成一个**等长**且合法的标识符（用于退化判据里的等长替换）。
+ *
+ * ⚠️ 等长是为了报错行列号不漂；而「合法」这一条踩过坑：早期直接写
+ * `'__import('.padEnd(match.length, ' ')` —— `'__import('` 比 `import(` 长 2，
+ * `padEnd` 不会截短，后面再 `slice` 就把**左括号截掉了**，得到 `__impor`，
+ * 编译报 `Unexpected string`。凡是「等长替换」都必须自己保证长度与合法性。
+ *
+ * @param name - 想用的标识符（超长会被截断）。
+ * @param length - 目标长度。
+ */
+function scriptSafeIdentifier(name, length) {
+  return name.slice(0, length).padEnd(length, '_');
+}
+
+/**
  * 把「只有模块里合法」的语法换成**脚本里合法的等价物**（只用于退化判据）。
  *
  * 退化判据是把源码当脚本编译，而两种语法在脚本里必然报错：
  *
  * | 语法 | 换成 | 说明 |
  * |---|---|---|
- * | `import.meta` | `__importMeta` | 普通的「点属性」写法 |
- * | `import(` | `__import(` | 普通调用表达式 |
+ * | `import.meta` | `__importMet…` | 普通的「点属性」写法（等长标识符） |
+ * | `import(` | `__impo(` | 普通调用表达式（等长标识符 + 原左括号） |
  *
- * ⚠️ 替换是**等长**的（用 `_` 补齐），行号与列号不漂，报错位置仍对得上原文件。
+ * ⚠️ 替换是**等长**的，行号与列号不漂，报错位置仍对得上原文件。
  *
  * @param source - 已剥离 ESM 语句的源码。
  * @returns 可当脚本编译的同长源码。
  */
 function withScriptSafeSubstitutions(source) {
   return source
-    .replace(/(?<![.\w$])import\.meta/g, (match) => '__importMeta'.padEnd(match.length, '_').slice(0, match.length))
-    .replace(/(?<![.\w$])import\s*\(/g, (match) => '__import('.padEnd(match.length, ' ').slice(0, match.length));
+    .replace(/(?<![.\w$])import\.meta/g, (match) => scriptSafeIdentifier('__importMeta', match.length))
+    .replace(
+      /(?<![.\w$])import\s*\(/g,
+      // 留出最后一位给 `(`，其余填成等长标识符 —— 括号**必须**保留。
+      (match) => `${scriptSafeIdentifier('__import', match.length - 1)}(`,
+    );
 }
 
 /**

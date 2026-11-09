@@ -1,5 +1,31 @@
 # 更新记录
 
+## 1.2.1 — 2026-11-09
+
+**修三个「退化判据」（Node 18 上 `--experimental-vm-modules` 缺席时走的进程内语法检查）
+误报合法代码的缺陷**。1.2.0 的 CI 在 Node 18 上就是这么红的：
+
+```
+scripts/verify-guard.mjs 语法错误: await is only valid in async functions and the top level bodies of modules（退化判据）
+```
+
+1. **顶层 await 被误报**。ESM 允许 `const fs = await import('node:fs')`，而脚本的函数体
+   不允许 —— 退化判据当时是直接 `compileFunction(残余体)`，于是把合法代码判成语法错误。
+   现在把残余体包进 `async () => { … }` 再编译：**只**放行「顶层 await」这一条 ESM 差异，
+   非 async 函数里的 await、其余语法错误照旧被抓到。
+2. **shebang 被误报**。`#!` 只在源文本**第 0 位**合法；包进 async 箭头函数后它落到函数体
+   中间 ⇒ `Invalid or unexpected token`（`patch.mjs`、`scripts/verify-guard.mjs` 都带 shebang）。
+   现在 `stripEsmSyntax` 先等长挖掉开头的 shebang；非开头的 `#!` 仍然报错。
+3. **等长替换把自己的括号截掉了**（老缺陷，被第 1 条的新用例顺手抓到）。
+   `withScriptSafeSubstitutions` 把 `import(` 换成 `'__import('.padEnd(7).slice(0,7)`
+   —— `'__import('` 本身比 7 长，`padEnd` 不截短，`slice` 于是砍掉了左括号，留下 `__impor`，
+   编译报 `Unexpected string`。现在用一个只做「截断 + 补 `_`」的等长标识符助手，
+   括号**一定**保留。
+
+新增 3 条用例（顶层 await / shebang / 真实资产在退化判据下也通过），并把
+`assets/codebuddy-guard.js`、`scripts/verify-guard.mjs` 纳入语法检查与真实产物用例 ——
+否则这两个新文件在 CI 上永远不会被这条防线看到。
+
 ## 1.2.0 — 2026-11-07
 
 **新增第三项能力：CodeBuddy（腾讯 `copilot.tencent.com`）出站守卫**。机制整条移植自

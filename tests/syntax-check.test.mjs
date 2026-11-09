@@ -44,10 +44,12 @@ test('形态判据看**行首**关键字：注释/正文里出现 import 不算 
   assert.equal(checkFileSyntax(realEsm).ok, true);
 });
 
-test('真实产物：三份客户端/宿主资产都通过', () => {
+test('真实产物：宿主/客户端资产都通过', () => {
   const files = [
     ['assets/rate-limit-resume.js', 'esm'],
     ['assets/client-rate-limit-resume.js', 'cjs'],
+    ['assets/codebuddy-guard.js', 'esm'],
+    ['scripts/verify-guard.mjs', 'esm'],
     ['patch.mjs', 'esm'],
   ];
   for (const [rel, expectedForm] of files) {
@@ -56,6 +58,40 @@ test('真实产物：三份客户端/宿主资产都通过', () => {
     assert.equal(result.ok, true, `${rel} 应通过语法检查：${result.message ?? ''}`);
     assert.equal(result.form, expectedForm, `${rel} 的形态判据`);
   }
+});
+
+test('退化判据（Node 18 无 vm.SourceTextModule）必须接受顶层 await', () => {
+  // 这一条是 CI 红的直接原因：`scripts/verify-guard.mjs` 用 `await import(...)`，
+  // 而 Node 18 的 CI 分支没有 `--experimental-vm-modules`，只能走退化判据 ——
+  // 旧实现把它当成脚本函数体编译，于是合法的顶层 await 被误报成语法错误。
+  const topLevelAwait = "import { join } from 'node:path';\n"
+    + "const fs = await import('node:fs');\n"
+    + "export const probe = join('a', 'b');\n";
+  const ok = checkSyntax(topLevelAwait, { form: 'esm', degraded: true });
+  assert.equal(ok.ok, true, ok.message);
+
+  // 但**非 async 函数里的 await** 仍然必须报错 —— 包一层 async IIFE 只放行
+  // 「顶层」这一条 ESM 差异，不能顺手把真错误也放过。
+  const insideSyncFn = 'export function f() {\n  await g();\n}\n';
+  assert.equal(checkSyntax(insideSyncFn, { form: 'esm', degraded: true }).ok, false);
+  // 常规语法错误在退化判据下照旧被抓到。
+  assert.equal(checkSyntax('export const y = ;\n', { form: 'esm', degraded: true }).ok, false);
+
+  // 真实资产在退化判据下也必须通过（复制 CI 在 Node 18 上跑的那条路径）。
+  for (const rel of ['assets/codebuddy-guard.js', 'scripts/verify-guard.mjs', 'patch.mjs']) {
+    const source = readFileSync(join(HERE, '..', rel), 'utf8');
+    const result = checkSyntax(source, { form: 'esm', degraded: true });
+    assert.equal(result.ok, true, `${rel} 在退化判据下也应通过：${result.message ?? ''}`);
+  }
+});
+
+test('退化判据必须容忍 shebang（ESM 只在源文本第 0 位允许 `#!`）', () => {
+  // `scripts/verify-guard.mjs` 与 `patch.mjs` 都带 shebang。退化判据把残余体包进
+  // async 箭头函数后，`#!` 会落到函数体中间 ⇒ 旧实现报「Invalid or unexpected token」。
+  const shebang = '#!/usr/bin/env node\nconst a = 1;\nexport const b = a;\n';
+  assert.equal(checkSyntax(shebang, { form: 'esm', degraded: true }).ok, true);
+  // 非开头的 `#!` 仍应报错（不是「见到 #! 就放过」）。
+  assert.equal(checkSyntax('const a = 1;\n#!oops\n', { form: 'esm', degraded: true }).ok, false);
 });
 
 test('客户端 bundle（含 CSS 模板字符串与 SVG 常量）仍判为 CJS 并编译通过', () => {
