@@ -14,6 +14,8 @@ const targets = [
   "patch.mjs",
   "assets/rate-limit-resume.js",
   "assets/client-rate-limit-resume.js",
+  "assets/client-expiry-first-switch.js",
+  "assets/expiry-first.js",
   "assets/codebuddy-guard.js",
   "scripts/sync-hashes.mjs",
   "scripts/ci-syntax-check.mjs",

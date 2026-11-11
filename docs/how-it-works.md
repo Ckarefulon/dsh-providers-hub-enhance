@@ -260,3 +260,72 @@ node scripts/verify-guard.mjs
 
 想看「到底哪一句会触发」，设 `DSH_CODEBUDDY_GUARD=dryrun` 再发一条消息，然后读
 `$DSH_HOME/jet-hub/codebuddy-guard.jsonl` 里的 `would-rewrite` 记录。
+
+
+## 10. 「临期置顶」为什么不按凭据有效期排
+
+账号卡片上有两处「期限」，含义完全不同：
+
+| 卡片上的位置 | 字段 | 过期会发生什么 |
+|---|---|---|
+| 有效期 | `ProviderAccountEntry.expiresAt` | **凭据 / 登录态过期**。多数渠道能静默续期（`refreshable`），续期成功后 `expiry-sync` 会把新值写回账号池 ⇒ 通常**不造成损失** |
+| 积分行 | `CreditBalance.packages[].deductionEndTime` | **额度作废**。时刻一过，包里剩多少就归零 ⇒ 真的白丢钱 |
+
+所以「临期期限近」= 该账号手里**最早会作废且还有余量**的积分包的到期时刻，
+判据逐条如下（`assets/expiry-first.js` 的 `packageExpiryMs`）：
+
+| 情况 | 处理 | 为什么 |
+|---|---|---|
+| `active !== true` | 跳过 | 已失效的包不再计费，算进去只是噪音 |
+| `remaining <= 0` | 跳过 | 否则「积分早就用完的号」会永远排第一 |
+| 没有 `deductionEndTime` | 视作**永久**，不参与排序 | 服务端没给到期时间 ≠ 马上过期；反过来把永久包排最前会让真正临期的号掉到后面 |
+| `deductionEndTime <= now` | 跳过 | 那批额度已经作废了，再把它顶到前面只会挤掉还有额度的号 |
+| 只有字符串 `expiredTime` | `Date.parse(换空格为 T)` 兜底 | officeace 这类渠道（`creditGroups[].expiresAt`）只给字符串；与客户端既有的 `packageExpiryMs` 同一口径 |
+
+顺序本身**就是**自动选号的优先级（`account-pool.ts` 的 `getAvailableAccount` 按数组序取第一个
+可用账号），所以这里走的是**真的写盘**（`account.reorder`，与拖拽写的是同一份），
+而不是一个只影响渲染的视图排序。
+
+### ⚠️ 写入侧必须用 `listAccountsByProvider`，不能用 `listAccounts`
+
+`listAccounts` 会**稳定地把限流中的账号沉到最后**（工单 08，纯视图排序，刻意**不动**存储
+顺序）。若拿它的返回顺序去算新顺序再写回，等于把「限流沉底」这个纯展示决定**固化进存储
+顺序** —— 限流一解除，那个号就真的留在末尾了（而不是自己回到原位）。故写入侧一律读
+`pool.listAccountsByProvider(provider)`（存储序）。
+
+### 触发时机：挂在 `credits.balances` 的返回处，不逐 provider 分支加
+
+开关打开后，重排的挂点是 `jet-hub-rpc.js` 里 `handleMethod` 返回**之前**那一处
+（与既有的 `credits.claimAll` 清临期折算缓存同一个位置）：
+
+```js
+if (call.method === 'credits.balances' && result?.ok === true
+    && Array.isArray(result.value?.accounts)) {
+    await applyExpiryFirstFromBalances(call.payload.provider, result.value.accounts);
+}
+```
+
+`credits.balances` 那个 case 里有**四个** `return`（opencode / qoder / officeace / 查表分派），
+逐分支去加必然漏一个 —— 而且 opencode 与 qoder 两条的返回语句还**一字不差**
+（拿它当锚点会命中 2 次）。挂在分派处一处覆盖全部，与既有手法一致。
+
+### 三条「不写盘」红线
+
+1. 渠道没有积分余额接口（`supportsCreditBalance(provider) === false`）⇒ 开关根本不渲染；
+2. 一个临期都算不出来（余额还没查 / 查询失败 / 渠道本来就没有到期概念）⇒ **一个字都不写盘**。
+   ⚠️ 这一条最要紧：`balance: null`（查询失败）与「没有临期」在数据里同形，照排等于把所有
+   账号按 `undefined` 重排一遍，用户拖好的顺序会被一次查询失败打乱；
+3. 算出来了但已经是最优顺序 ⇒ 不发 `account.reorder`（`plan.reordered === false` 判据）。
+   另外 `reorder` 抛错只记一条 warn、不上抛 —— 余额已经查回来了，让排序失败把整份余额
+   一并报废是拿功能换装饰。
+
+> 复用的既有 RPC：`account.reorder`（`jet-hub-rpc.js` 已有端点，集合一致性校验也在宿主侧）。
+> 余额本来就已由 `credits.balances` 拉到面板里 ⇒ 本功能**没有新增任何网络请求**。
+> 新增的只有两条**本地**端点：`expiry.getState` / `expiry.setEnabled`。
+
+### 开关状态落盘
+
+`$DSH_HOME/jet-hub/expiry-first.json`（与 `rate-limit-resume.json` / `ui-preferences.json`
+同目录，同「tmp + rename」原子写惯例）。**默认关**：它会改写用户自己拖出来的顺序，
+未经同意不该自动动。读失败 / 文档损坏一律回落到默认（关）并留一条 warn —— 这是体验层
+功能，配置写坏不该让插件起不来。

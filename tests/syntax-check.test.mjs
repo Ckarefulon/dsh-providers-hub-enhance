@@ -48,6 +48,8 @@ test('真实产物：宿主/客户端资产都通过', () => {
   const files = [
     ['assets/rate-limit-resume.js', 'esm'],
     ['assets/client-rate-limit-resume.js', 'cjs'],
+    ['assets/client-expiry-first-switch.js', 'cjs'],
+    ['assets/expiry-first.js', 'esm'],
     ['assets/codebuddy-guard.js', 'esm'],
     ['scripts/verify-guard.mjs', 'esm'],
     ['patch.mjs', 'esm'],

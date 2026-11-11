@@ -164,6 +164,12 @@
       "patchedSha256": "01b880f067775420f597f0578c193de50f670dee502aa7de7d661247e5670328"
     },
     {
+      "path": "lib/expiry-first.js",
+      "mode": "create",
+      "asset": "assets/expiry-first.js",
+      "patchedSha256": "db0e9d8844a8e512d87dfc83c7607628d9bd7b5c2ba77eea411af475540112eb"
+    },
+    {
       "path": "lib/buddy-adapter.js",
       "mode": "anchor",
       "edits": [
@@ -253,6 +259,24 @@
       ]
     },
     {
+      "path": "lib/index.js",
+      "mode": "anchor",
+      "edits": [
+        {
+          "find": [
+            "    installRateLimitResume(ctx, pool);"
+          ],
+          "replace": [
+            "    installRateLimitResume(ctx, pool);",
+            "    // 「临期置顶」：按「临期积分最近作废」自动重排账号池顺序（开关在账号面板，",
+            "    // 状态落 `$DSH_HOME/jet-hub/expiry-first.json`）。默认**关** —— 它会改写",
+            "    // 用户自己拖出来的顺序，未经同意不该自动动。",
+            "    installExpiryFirst(ctx, pool);"
+          ]
+        }
+      ]
+    },
+    {
       "path": "lib/jet-hub-rpc.js",
       "mode": "anchor",
       "edits": [
@@ -329,10 +353,100 @@
       ]
     },
     {
+      "path": "lib/jet-hub-rpc.js",
+      "mode": "anchor",
+      "edits": [
+        {
+          "find": [
+            "import {",
+            "    readRateLimitResumeState,",
+            "    setRateLimitResumeArmed,",
+            "    setRateLimitResumeEnabled,",
+            "} from './rate-limit-resume.js';"
+          ],
+          "replace": [
+            "import {",
+            "    readRateLimitResumeState,",
+            "    setRateLimitResumeArmed,",
+            "    setRateLimitResumeEnabled,",
+            "} from './rate-limit-resume.js';",
+            "import {",
+            "    applyExpiryFirstFromBalances,",
+            "    readExpiryFirstState,",
+            "    setExpiryFirstEnabled,",
+            "} from './expiry-first.js';"
+          ]
+        },
+        {
+          "find": [
+            "                if (call.method === 'credits.claimAll') {",
+            "                    modelAdapters?.['aggregate']?.clearExpiryCache?.();",
+            "                }",
+            "                return reply(rpcId, result);"
+          ],
+          "replace": [
+            "                if (call.method === 'credits.claimAll') {",
+            "                    modelAdapters?.['aggregate']?.clearExpiryCache?.();",
+            "                }",
+            "                // 「临期置顶」（本补丁新增）：开关打开时，按**刚查回来的这份余额**",
+            "                // 重排该 provider 的账号池顺序。挂在这里而不是各 provider 分支：",
+            "                // 那个 case 里有四个 `return`（opencode / qoder / officeace / 查表分派），",
+            "                // 逐分支加必然漏（其中两条的返回语句还是一字不差的）。",
+            "                // ⚠️ 失败不上抛（`applyExpiryFirstFromBalances` 内部已吞掉并记 warn）：",
+            "                //    余额已经查回来了，让排序失败把整份余额一并报废是拿功能换装饰。",
+            "                if (call.method === 'credits.balances' && result?.ok === true",
+            "                    && Array.isArray(result.value?.accounts)) {",
+            "                    await applyExpiryFirstFromBalances(call.payload.provider, result.value.accounts);",
+            "                }",
+            "                return reply(rpcId, result);"
+          ]
+        },
+        {
+          "find": [
+            "            case 'officeace.status': {"
+          ],
+          "replace": [
+            "            // ── 「临期置顶」开关（本补丁新增）──",
+            "            //",
+            "            // 状态与排序都在 `expiry-first.js` 的模块级控制器里（见那个文件头说明",
+            "            // 「为什么不给本函数加位置形参」）。控制器缺席时如实回 `available: false`",
+            "            // —— 客户端据此把整个开关收掉，界面不该显示一个永远不生效的开关。",
+            "            case 'expiry.getState': {",
+            "                return { ok: true, value: readExpiryFirstState() };",
+            "            }",
+            "            case 'expiry.setEnabled': {",
+            "                const req = payload ?? {};",
+            "                // ⚠️ 与 `gateway.setEnabled` / `nativeSearch.setEnabled` 同约定：",
+            "                // **不做默认值猜测** —— 漏了字段就报错，别默认成 true 静默打开。",
+            "                if (typeof req.enabled !== 'boolean') {",
+            "                    return { ok: false, error: { code: 'bad-request', message: '非空布尔 enabled 必填' } };",
+            "                }",
+            "                const value = await setExpiryFirstEnabled(req.enabled);",
+            "                if (value.available) {",
+            "                    ctx.logger?.info?.(`[jet-hub] ${value.enabled ? '打开' : '关闭'}「临期置顶」`);",
+            "                }",
+            "                return { ok: true, value };",
+            "            }",
+            "            case 'officeace.status': {"
+          ]
+        }
+      ]
+    },
+    {
       "path": "lib/client/jet-hub.js",
       "mode": "anchor-asset",
       "asset": "assets/client-rate-limit-resume.js",
       "marker": "function installRateLimitResumeUi",
+      "position": "after",
+      "anchor": [
+        "var JET_HUB_RPC_CHANNEL = \"/jet-hub\";"
+      ]
+    },
+    {
+      "path": "lib/client/jet-hub.js",
+      "mode": "anchor-asset",
+      "asset": "assets/client-expiry-first-switch.js",
+      "marker": "function PhcExpiryFirstSwitch",
       "position": "after",
       "anchor": [
         "var JET_HUB_RPC_CHANNEL = \"/jet-hub\";"
@@ -347,6 +461,36 @@
       "anchor": [
         "   esbuild 的报错会指向注释行、看起来像 CSS 写错）。本条注释就曾踩过。 */",
         ""
+      ]
+    },
+    {
+      "path": "lib/client/jet-hub.js",
+      "mode": "anchor",
+      "edits": [
+        {
+          "find": [
+            "        { className: \"dim-jh-headerActions\" },",
+            "        React2.createElement(\"button\", {",
+            "          className: \"dim-jh-btn\",",
+            "          title: MODEL_LIST_HELP,"
+          ],
+          "replace": [
+            "        { className: \"dim-jh-headerActions\" },",
+            "        // 「临期置顶」**开关**（本补丁新增）。放在按钮行第一个：它是策略级开关，",
+            "        // 与右边那排一次性动作（显示列表 / 刷新积分 / 重测所有）不同类。",
+            "        // ⚠️ 只在积分有意义（`canLoadCredits`）的渠道出现 —— 其余渠道既算不出临期，",
+            "        //    也没有可作废的额度，摆一个必然显示「不可用」的开关是噪音。",
+            "        canLoadCredits ? React2.createElement(PhcExpiryFirstSwitch, {",
+            "          rpcCall,",
+            "          // 宿主打开开关时会立刻按缓存余额重排账号池，但面板手里那份 `accounts`",
+            "          // 不会自己更新 ⇒ 排完再读一次列表，用户当场就能看到顺序变了。",
+            "          onChanged: () => { void loadAccounts(); }",
+            "        }) : null,",
+            "        React2.createElement(\"button\", {",
+            "          className: \"dim-jh-btn\",",
+            "          title: MODEL_LIST_HELP,"
+          ]
+        }
       ]
     },
     {

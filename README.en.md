@@ -9,6 +9,7 @@ descriptions, not patched files: after every plugin upgrade, run it again.
 | **CodeBuddy fetch guard** | DeepSeek Harness' own prompt text trips Tencent's domestic gateway (`400 / 11128`); the guard rewrites four fingerprints at the fetch layer — for `copilot.tencent.com` only |
 | **Raccoon daily check-in** | Also claims the **mobile login reward (+3000 credits)** upstream never implemented |
 | **Resume after rate limiting** | When a turn dies on 429 / exhausted quota, a toggleable icon button appears on the error row and resumes the turn once the limit lifts; a switch in Jet Hub settings decides the default |
+| **"Expiring first" switch** | A switch next to the account-panel title: when on, accounts whose **credits expire soonest** are moved to the top automatically — that is the quota you actually lose, unlike credential expiry, which mostly refreshes itself |
 
 ```bash
 node patch.mjs          # apply
@@ -120,6 +121,38 @@ today's 300 credits; accounts that had already claimed the desktop reward still 
 `granted: true` on the mobile one.
 
 See [docs/how-it-works.md](docs/how-it-works.md) for the protocol details.
+
+## 4. "Expiring first" switch
+
+A switch at the front of the account panel's action row. Once **on**, every time the panel
+reads credit balances it automatically moves accounts whose credits expire soonest to the top.
+
+**Why a switch and not a one-shot button.** A button means "I want this order right now", but
+this preference keeps going stale: new packages enter the expiry window daily and others lapse.
+You would have to remember to press it again. The switch means "keep it this way" — its state
+lives in the host (`$DSH_HOME/jet-hub/expiry-first.json`), so it survives closing the panel and
+restarting the host.
+
+**Why credit expiry and not the "expires at" row.** The card shows two very different
+deadlines: the credential's `expiresAt` (mostly auto-refreshable, so it usually costs you
+nothing) and each credit package's `deductionEndTime` (once that instant passes, whatever is
+left in the package is gone). The switch therefore sorts by the earliest *still usable* package
+expiry, skipping empty packages, expired packages, and packages with no expiry at all (those are
+permanent, not "about to expire").
+
+- The order **is** the automatic account-selection priority, so it really rewrites the pool
+  (`account.reorder`, the same record drag-and-drop writes) — not a view-only sort.
+- Accounts without expiring credits stay at the bottom, keeping the relative order you dragged
+  them into (stable sort).
+- **Off by default**: it rewrites an order you created, so it must not do that unasked.
+- Three "write nothing" red lines: nothing expiring can be computed (balance not read yet, query
+  failed, or the provider has no expiry concept) → no write at all; already optimal → no write;
+  the reorder call fails → log only, the balance reading is unaffected.
+- It never fires a balance query of its own: the trigger is the balance read the panel already
+  does. Press "刷新积分" to refresh immediately.
+
+Only appears for providers whose accounts already have a credit row
+(`supportsCreditBalance(provider)`).
 
 ## Install
 

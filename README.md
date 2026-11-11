@@ -2,13 +2,14 @@
 
 给 [dsh-providers-hub](https://www.npmjs.com/package/dsh-providers-hub) 打**增强补丁** —— 可重放、可还原、带守卫。
 
-目前补三件事：
+目前补四件事：
 
 | 能力 | 一句话 |
 |---|---|
 | **CodeBuddy 出站守卫** | 腾讯国内网关的 `400 / 11128` 不再拦 DSH 的提示词；只对 `copilot.tencent.com` 生效，别的渠道一字节不碰 |
 | **Raccoon 每日签到** | 顺带把上游漏掉的**手机端登录奖励 +3000 积分**也打回来 |
 | **限流中断后「解禁后自动继续」** | 会话因 429 / 额度耗尽中断时，报错行尾给一个可切换的图标按钮，解禁后自动续上；Jet Hub 设置页顶部有默认开关 |
+| **「临期置顶」开关** | 账号面板标题旁一个开关，打开后每次读到余额就把**临期积分最近作废**的账号自动排到上方（这才是会白丢的额度，凭据有效期多数能自动续期） |
 
 补丁改的是 `node_modules` 里的构建产物，所以本项目交付的不是「改好的文件」，而是一个补丁器：插件升级/重装之后，重跑一次就补回来。
 
@@ -134,6 +135,46 @@ Get-Content "$env:USERPROFILE\.dsh\jet-hub\codebuddy-guard.jsonl" -Tail 20
 
 细节与协议依据见 [docs/how-it-works.md](docs/how-it-works.md)。
 
+## 4. 「临期置顶」开关
+
+账号面板标题下面那排操作的最前面，多一个开关：`临期置顶`。**打开后一直有效** ——
+每次面板读到积分余额，就自动把**临期积分最近作废**的账号按到期先后排到列表上方。
+
+### 为什么是开关而不是「一键排序」按钮
+
+一次性按钮的语义是「我此刻想要这个顺序」，而这件事**会反复失效**：每天都有新的积分包
+进入临期窗口、有账号的包作废掉。你得每天记得再点一次。开关是「我要一直这样」：
+状态住在宿主（`$DSH_HOME/jet-hub/expiry-first.json`），面板关掉再打开、宿主重启之后
+都还是那个值。
+
+### 为什么按「临期积分」而不按「有效期」
+
+卡片上有两处「期限」，含义完全不同：
+
+| 卡片上的位置 | 过期会发生什么 |
+|---|---|
+| **有效期** | 凭据 / 登录态过期。多数渠道能静默续期（`refreshable`）⇒ 通常**不丢东西** |
+| **积分行** | 额度作废。时刻一过，包里剩多少就归零 ⇒ **真的白丢** |
+
+所以「期限近」取的是后者：该账号手里**最早会作废且还有余量**的那个积分包的
+`deductionEndTime`。判据细节（空包、已失效包、永久包、已作废包、只有字符串
+`expiredTime` 的渠道）见 [docs/how-it-works.md §10](docs/how-it-works.md)。
+
+### 它会做什么、不会做什么
+
+- ✅ 顺序**就是自动选号的优先级**，所以它真的改写账号池顺序（`account.reorder`，
+  与拖拽写的是同一份），不是只影响渲染的视图排序。
+- ✅ 没有临期积分的账号留在**末尾**，并保持你拖出来的相对顺序（稳定排序）。
+- ✅ **默认关**：它会改写你自己的顺序，未经同意不该自动动。
+- ✅ 三条「不写盘」红线：一个临期都算不出来（余额没读到 / 查询失败 / 渠道没有到期
+  概念）⇒ 一个字都不写盘；已经是最优顺序 ⇒ 不写；顺序写失败 ⇒ 只记日志，
+  余额照常显示。
+- ❌ 不会自己发起余额查询：触发时机是「面板本来就有的那次余额查询」。
+  想立刻生效就点一下「刷新积分」。
+
+开关只在 `supportsCreditBalance(provider)` 为真（卡片上本来就有积分行）的渠道出现
+—— 其余渠道既算不出临期，也没有会作废的额度。
+
 ## 快速开始
 
 前置：Node.js ≥ 18，且本机已经装好 `dsh-providers-hub` 插件。
@@ -196,11 +237,12 @@ node patch.mjs
 | 文件 | 改动 |
 |---|---|
 | `lib/codebuddy-guard.js` | **新建**：fetch 层守卫（四段指纹改写 / host 过滤 / 幂等 / fail-open / dryRun / JSONL 日志 / 单例安装） |
-| `lib/index.js` | `apply()` **最前面**装 `installCodeBuddyGuard(ctx)`；另装上 `installRateLimitResume(ctx, pool)` |
+| `lib/index.js` | `apply()` **最前面**装 `installCodeBuddyGuard(ctx)`；另装 `installRateLimitResume(ctx, pool)` 与 `installExpiryFirst(ctx, pool)` |
 | `lib/buddy-adapter.js` | 构造改走 `guardCodeBuddyFetch(options.fetchImpl ?? fetch)`（兜住加载顺序） |
 | `lib/rate-limit-resume.js` | **新建**：限流判据、解禁时刻推算、待续跑钩子（含落盘与恢复）、`agent.followup` 投递 |
-| `lib/jet-hub-rpc.js` | 三条端点 `resume.getState` / `resume.setArmed` / `resume.setEnabled` |
-| `lib/client/jet-hub.js` | 报错行尾图标按钮（DOM 增强）+ 设置页顶部默认开关 |
+| `lib/expiry-first.js` | **新建**：临期判据（积分包到期）、稳定排序、开关状态落盘、按余额重排账号池 |
+| `lib/jet-hub-rpc.js` | 三条 `resume.*` 端点 + 两条 `expiry.*` 端点；`credits.balances` 返回后按开关重排 |
+| `lib/client/jet-hub.js` | 报错行尾图标按钮（DOM 增强）+ 设置页顶部默认开关 + 账号面板「临期置顶」开关 |
 | `lib/raccoon-credits.js` | 新增 `claimRaccoonDailyCheckin` / `triggerRaccoonDailyGrant` / `fetchRaccoonTodayGrants`；登录奖励两端合并；状态改走 v2 income 账单 |
 | `lib/raccoon.js` | 办公端 / 移动端前缀与客户端身份常量 |
 | `lib/raccoon-auth.js` | `claimDailyCheckin()` 实例方法（走注入的 `fetchImpl`） |
@@ -242,6 +284,18 @@ node patch.mjs
 
 **会不会多领/重复领？**
 不会。触发端点是按天幂等的；登录奖励每个账号每端只能领一次（服务端返回 `granted:false`）。
+
+**打开「临期置顶」后顺序没变？**
+三种情况都不写盘（这是有意的）：① 面板还没读到余额（先点「刷新积分」）；② 这个渠道
+查不到任何临期积分（余额查询失败，或它的积分本来就没有到期时间）；③ 已经是最优顺序。
+宿主日志里会留一条 `[jet-hub] 「临期置顶」已重排 <provider>：…`。
+
+**打开它会不会打乱我拖好的顺序？**
+只在「确实有账号的临期积分排错了位置」时才重排，且**同一天到期**、**同样没有临期积分**的
+账号之间保持你拖出来的相对顺序（稳定排序）。关掉开关就彻底不碰顺序。
+
+**它能撤掉吗？**
+把开关关上即可恢复「只按你拖的顺序」；`expiry-first.json` 里只存一个布尔值。
 
 **能卸载吗？**
 ```bash
