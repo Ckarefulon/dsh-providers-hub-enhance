@@ -2,17 +2,20 @@
 /**
  * dsh-providers-hub-enhance —— 给 `dsh-providers-hub` 打**增强补丁**（可重放、可还原、带守卫）。
  *
- * 目前补三件事：
+ * 目前补两件事（都只补**上游仍然缺的**）：
  *
- * 1. **CodeBuddy（腾讯 `copilot.tencent.com`）出站守卫**：DSH 自己的提示词里有四段会被
- *    国内网关判成「非授权渠道调用」（400 / code 11128），在 fetch 层做语义等价改写。
- *    机制移植自 dsh-wb400-guard，只对 CodeBuddy 一个提供方生效（详见
- *    `assets/codebuddy-guard.js` 的模块头）。
- * 2. **Raccoon（商汤小浣熊）每日签到**：上游「没有签到端点」是漏查，真正的触发器
+ * 1. **Raccoon（商汤小浣熊）每日签到**：上游「没有签到端点」是漏查，真正的触发器
  *    在办公端（详见 docs/how-it-works.md）。
- * 3. **限流中断后的「解禁后自动继续」**：会话因限流（429 / 额度耗尽）中断时，
+ * 2. **限流中断后的「解禁后自动继续」**：会话因限流（429 / 额度耗尽）中断时，
  *    在报错行尾给一个可切换的图标按钮，等限流解禁后自动把会话续上；Jet Hub
- *    设置页顶部有一个总开关决定默认行为。
+ *    设置弹窗里有一个总开关决定默认行为。
+ *
+ * ## ⚠️ 曾经补过、现已**删除**的两项（上游 2.22 自己实现了）
+ *
+ * | 曾经 | 为什么删 |
+ * |---|---|
+ * | CodeBuddy 出站守卫（fetch 层改写四段指纹） | 上游 `openai-gateway/tencent-fingerprint.js` 已覆盖同样四段，且 `buddy-growth` / `buddy-compensation` 不做任何裸 HTTP（没有绕过路径）⇒ 再包一层 fetch 只是徒增风险 |
+ * | 账号「临期置顶」开关 | 上游已按**积分到期档位**排序（默认开启）并配了 `strictManualOrder` 开关 ⇒ 语义重复，且两套一起动会互相打架 |
  *
  * ## 为什么是「补丁器」而不是直接改文件
  *
@@ -66,6 +69,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkFileSyntax } from './scripts/syntax-check.mjs';
+import { checkWiring, collectOwnNames, describeWiringFailure } from './scripts/wiring-check.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_DATA = join(HERE, 'patch-data.json');
@@ -511,11 +515,17 @@ export function runPatch(argv, options = {}) {
     writeManifest(target.dir, existing);
   }
 
-  // 写盘后语法自检：宿主侧模块语法错误会让 DSH 直接起不来，宁可在这一步拦下。
+  // 写盘后两道自检（都在**进程内**，见各自脚本头）：
   //
-  // ⚠️ 判据是**进程内**的（`scripts/syntax-check.mjs`）：DSH 自己的 Windows 沙箱
-  // 禁止 `spawn`（EPERM），而 `node --check` 是子进程 —— 只靠它的话，受限环境里
-  // 这一层保护等于不存在（只能「如实跳过」，语法错误留到重启后炸）。
+  // ① **语法**：宿主侧模块语法错误会让 DSH 直接起不来，宁可在这一步拦下。
+  //    ⚠️ DSH 自己的 Windows 沙箱禁止 `spawn`（EPERM），而 `node --check` 是子进程
+  //    —— 只靠它的话，受限环境里这一层保护等于不存在（只能「如实跳过」）。
+  //
+  // ② **接线**：插入的调用必须有 import / 就地定义。这一道是**真实事故**换来的
+  //    （2026-11-12）：上一版在 `lib/index.js` 里插了 `installExpiryFirst(ctx, pool)`
+  //    却没带配套 import ⇒ `apply()` 抛 ReferenceError ⇒ 后面的 `registerJetHubRpc`
+  //    从未执行 ⇒ `/api/jet-hub` 整条通道 404。语法自检查不出它（那是运行时错误），
+  //    锚点守卫也看不出（锚点全命中了）。
   if (args.verify) {
     let broken = null;
     for (const item of pending) {
@@ -523,14 +533,27 @@ export function runPatch(argv, options = {}) {
       const result = checkFileSyntax(source);
       if (result.ok === false) { broken = { path: item.path, output: result.message }; break; }
     }
+    if (broken === null) {
+      // ⚠️ 只看**被打过补丁的文件**：`pending` 里就是它们。资产路径从 patch-data 现取，
+      //    故新增资产不需要动这里。
+      const assetPaths = [...new Set(data.files.map((file) => file.asset).filter((asset) => typeof asset === 'string'))]
+        .map((asset) => assetPath(asset));
+      const ownNames = collectOwnNames(assetPaths.map((asset) => readFileSync(asset, 'utf8')));
+      for (const item of pending) {
+        if (!item.path.endsWith('.js')) continue;
+        const source = item.bytes !== null ? new TextDecoder().decode(item.bytes) : item.text;
+        const wiring = checkWiring(source, ownNames);
+        if (!wiring.ok) { broken = { path: item.path, output: describeWiringFailure(item.path, wiring.missing) }; break; }
+      }
+    }
     if (broken) {
-      // 回滚：语法都不对，绝不能留在盘上。
+      // 回滚：语法/接线都不对，绝不能留在盘上。
       for (const item of pending) {
         const backup = item.abs + BACKUP_SUFFIX;
         if (newlyCreated.has(item.path)) { rmSync(item.abs, { force: true }); continue; }
         if (existsSync(backup)) copyFileSync(backup, item.abs);
       }
-      const message = `语法自检失败：${broken.path}\n${broken.output}`;
+      const message = `写盘后自检失败：${broken.path}\n${broken.output}`;
       say(`❌ ${message}`);
       say('');
       say('已从备份回滚。');
@@ -543,9 +566,9 @@ export function runPatch(argv, options = {}) {
   log('');
   log('生效方式（宿主侧模块在启动时加载，必须重启进程）：');
   log('  1. 自己重启 DSH；');
-  log('  2. 重启后刷新页面：Raccoon 卡片上出现「一键领取积分」，');
-  log('     限流中断的报错行尾出现「解禁后自动继续」图标按钮；');
-  log('  3. 走 CodeBuddy（buddy）时不再撞 400/11128 —— 想确认就先跑 `node scripts/verify-guard.mjs`。');
+  log('  2. 重启后刷新页面：Raccoon 卡片上出现「一键领取积分」；');
+  log('     限流中断的报错行尾出现「解禁后自动继续」图标按钮，Jet Hub 设置弹窗');
+  log('     的「中断后自动继续」分区里有同名默认值开关。');
   return { exitCode: 0, report: { ...report, changed: pending.length }, lines };
 }
 

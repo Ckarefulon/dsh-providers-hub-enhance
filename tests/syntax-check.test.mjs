@@ -48,10 +48,7 @@ test('真实产物：宿主/客户端资产都通过', () => {
   const files = [
     ['assets/rate-limit-resume.js', 'esm'],
     ['assets/client-rate-limit-resume.js', 'cjs'],
-    ['assets/client-expiry-first-switch.js', 'cjs'],
-    ['assets/expiry-first.js', 'esm'],
-    ['assets/codebuddy-guard.js', 'esm'],
-    ['scripts/verify-guard.mjs', 'esm'],
+    ['scripts/wiring-check.mjs', 'esm'],
     ['patch.mjs', 'esm'],
   ];
   for (const [rel, expectedForm] of files) {
@@ -63,9 +60,9 @@ test('真实产物：宿主/客户端资产都通过', () => {
 });
 
 test('退化判据（Node 18 无 vm.SourceTextModule）必须接受顶层 await', () => {
-  // 这一条是 CI 红的直接原因：`scripts/verify-guard.mjs` 用 `await import(...)`，
-  // 而 Node 18 的 CI 分支没有 `--experimental-vm-modules`，只能走退化判据 ——
-  // 旧实现把它当成脚本函数体编译，于是合法的顶层 await 被误报成语法错误。
+  // 这一条是 CI 红的直接原因：`tests/wiring-check.test.mjs` 与 `patch.mjs` 都会用到
+  // `await import(...)`，而 Node 18 的 CI 分支没有 `--experimental-vm-modules`，
+  // 只能走退化判据 —— 旧实现把它当成脚本函数体编译，于是合法的顶层 await 被误报。
   const topLevelAwait = "import { join } from 'node:path';\n"
     + "const fs = await import('node:fs');\n"
     + "export const probe = join('a', 'b');\n";
@@ -80,7 +77,7 @@ test('退化判据（Node 18 无 vm.SourceTextModule）必须接受顶层 await'
   assert.equal(checkSyntax('export const y = ;\n', { form: 'esm', degraded: true }).ok, false);
 
   // 真实资产在退化判据下也必须通过（复制 CI 在 Node 18 上跑的那条路径）。
-  for (const rel of ['assets/codebuddy-guard.js', 'scripts/verify-guard.mjs', 'patch.mjs']) {
+  for (const rel of ['assets/rate-limit-resume.js', 'scripts/wiring-check.mjs', 'patch.mjs']) {
     const source = readFileSync(join(HERE, '..', rel), 'utf8');
     const result = checkSyntax(source, { form: 'esm', degraded: true });
     assert.equal(result.ok, true, `${rel} 在退化判据下也应通过：${result.message ?? ''}`);
@@ -88,8 +85,8 @@ test('退化判据（Node 18 无 vm.SourceTextModule）必须接受顶层 await'
 });
 
 test('退化判据必须容忍 shebang（ESM 只在源文本第 0 位允许 `#!`）', () => {
-  // `scripts/verify-guard.mjs` 与 `patch.mjs` 都带 shebang。退化判据把残余体包进
-  // async 箭头函数后，`#!` 会落到函数体中间 ⇒ 旧实现报「Invalid or unexpected token」。
+  // `patch.mjs` 带 shebang。退化判据把残余体包进 async 箭头函数后，`#!` 会落到
+  // 函数体中间 ⇒ 旧实现报「Invalid or unexpected token」。
   const shebang = '#!/usr/bin/env node\nconst a = 1;\nexport const b = a;\n';
   assert.equal(checkSyntax(shebang, { form: 'esm', degraded: true }).ok, true);
   // 非开头的 `#!` 仍应报错（不是「见到 #! 就放过」）。

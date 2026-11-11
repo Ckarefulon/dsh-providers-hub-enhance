@@ -1,5 +1,59 @@
 # 更新记录
 
+## 2.0.0 — 2026-11-12
+
+**对齐 `dsh-providers-hub@2.22.261111`，并删掉两项已被上游实现的能力。**
+
+### 1. 修一个把整个插件打崩的缺陷（重要）
+
+1.3.0 在 `lib/index.js` 里插入了 `installExpiryFirst(ctx, pool);`，**却漏了配套的
+`import { installExpiryFirst } from './expiry-first.js';`** —— 那条 import 在用脚本
+重写 `patch-data.json` 时被悄悄丢了。后果不是「功能不生效」，而是：
+
+```
+apply() 抛 ReferenceError: installExpiryFirst is not defined
+  ⇒ 同一函数里后面的 registerJetHubRpc(...) 从未执行
+  ⇒ /api/jet-hub 整条通道 404（面板全线 transport failure）
+```
+
+三道既有防线全都拦不住：**语法自检只编译、不解析标识符**（`f()` 里 `f` 未定义是
+运行时错误）；锚点守卫的锚点全都正常命中；单元测试测的是资产模块本身，不是
+「被 import 进宿主之后」的接线。
+
+新增第 4 道防线 **`scripts/wiring-check.mjs`**：补丁插入的每个「本补丁自有函数调用」
+都必须在同一个最终文件里能 **import 到或就地定义**，否则写盘后**直接回滚**。
+它已接进 `patch.mjs` 的写盘自检与 CI，并有 6 条用例锁住（其中一条直接复刻事故形态）。
+判据刻意做得极窄（只查自有名字，不猜上游代码）：宁可漏报，也不要用误报把好补丁挡下。
+
+顺带修掉同类隐患：`import` 的名字若写错、或调用了未导出的名字，也会被这条挡住。
+
+### 2. 删掉两项（上游 2.22 自己实现了）
+
+| 删掉的 | 依据 |
+|---|---|
+| **CodeBuddy 出站守卫**（fetch 层改写四段指纹） | 上游 `lib/openai-gateway/tencent-fingerprint.js` 已覆盖**同样四段**指纹（连 2026-10-28 那次真实报障都写进了注释）；且 `buddy-growth` / `buddy-compensation` **不做任何裸 HTTP** ⇒ 不存在绕过路径。再包一层 `globalThis.fetch` 只是徒增风险 |
+| **账号「临期置顶」开关**（1.3.0 刚做的那个） | 上游已**按积分到期档位排序**（`ORDER_HINT_SUBTLE` 明说「某号没有临期积分时会被排到后面」），且**默认开启**，并配了 `strictManualOrder` 开关（RPC `strictManualOrder.getEnabled` / `setEnabled`，池内持久化）来做反选。语义重复，两套一起动会互相打架 |
+
+对应资产/测试/脚本一并删除：`assets/codebuddy-guard.js`、`assets/expiry-first.js`、
+`assets/client-expiry-first-switch.js`、`tests/codebuddy-guard.test.mjs`、
+`tests/expiry-first.test.mjs`、`scripts/verify-guard.mjs`（`npm run verify` 随之取消）。
+
+> 这两项都是**因为上游变好而退役**，不是因为不好用。仍需要它们的话用 1.x。
+
+### 3. 保留的两项在新版上重新接线
+
+- **Raccoon 每日签到**：上游 `provider-credits.js` 仍写着
+  「Raccoon Work 不支持每日签到」⇒ 仍然需要。`lib/raccoon-credits.js` 在新版里
+  与已知原版**逐字节相同**，整文件替换继续有效。
+- **限流中断后「解禁后自动继续」**：上游只有 `loop-recovery`（思考打转），
+  **没有**限流续跑 ⇒ 仍然需要。新版页头改成了「左侧导轨 + 设置弹窗」，
+  原来挂在页头那排 `.dim-jh-headerActions` 的默认开关已**搬进设置弹窗**的
+  「中断后自动继续」分区（锚点：`// ② 定时签到` 之后），用的是上游自己的
+  `.dim-jh-settingsSection*` 样式。
+
+兼容性：`2.22.261111` 全部 12 条补丁项一次打上，`--check` 报「全部文件已就位」。
+`1.6.261016` 仍可用（只是会少掉上面删掉的两项）。
+
 ## 1.3.0 — 2026-11-12
 
 **新增第四项能力：「临期置顶」开关**（账号面板标题下那排操作的最前面）。
