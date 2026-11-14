@@ -314,10 +314,13 @@ export function createRateLimitResumeEngine(options = {}) {
     let enabled = options.enabled !== false;
     // ⚠️ 构造时就接上投递通道：`installRateLimitResume` 在创建引擎时已经把
     // `deliver` 传进来了（它内部再经 agents 作用域解析）。早期这里写成裸
-    // `let deliver;` 而只认 `setDeliver()`，于是「恢复出来的钩子在 agents 就绪
+    // `let deliver;` 而只认后来的注入函数，于是「恢复出来的钩子在 agents 就绪
     // 前到点」会走进 `typeof deliver !== 'function'` 分支 —— 表现为每次只推迟
     // 5 分钟、一次都投不出去（单测抓到的真实缺陷）。
-    let deliver = typeof options.deliver === 'function' ? options.deliver : undefined;
+    //
+    // ⚠️ 它**只由构造参数决定，永不替换**：第二个同型缺陷见 `rearm()` 的注释
+    //（`setDeliver(() => {})` 把真投递换成了空函数）。
+    const deliver = typeof options.deliver === 'function' ? options.deliver : undefined;
     let disposed = false;
 
     function drop(hook, reason) {
@@ -487,10 +490,23 @@ export function createRateLimitResumeEngine(options = {}) {
         status() {
             return { enabled, hooks: [...hooks.values()].map(hookSnapshot).sort((left, right) => left.resetAtMs - right.resetAtMs) };
         },
-        /** 注入投递通道（agents 服务就绪后由 install 调用）。 */
-        setDeliver(fn) {
-            deliver = typeof fn === 'function' ? fn : undefined;
-            // 之前因为「没有投递通道」被推迟的钩子，现在可以按原解禁时刻重排。
+        /**
+         * 按各自解禁时刻重排全部定时器（agents 服务就绪后由 install 调用）。
+         *
+         * ⚠️ 这里**只重排、不换投递函数**。投递通道是构造时经 `options.deliver`
+         * 注入的（它内部惰性解析 agents 作用域），没有「晚点再注入」的需求。
+         *
+         * 事故史：早期这里叫 `setDeliver(fn)`，而 `installRateLimitResume` 在
+         * `ctx.inject(['agents'])` 回调里写的是 `engine.setDeliver(() => {})` ——
+         * 本意是「通道就绪了，重排一下」，实际却把真正能投递的那个函数**换成了
+         * 返回 `undefined` 的空函数**。于是解禁时刻到了、定时器正常触发、
+         * `deliver(hook)` 返回 `undefined` ⇒ 判成投递失败 ⇒ 每 5 分钟重试一次，
+         * 24 次之后丢弃。真机表现正是「按钮有了、时间到了没有任何动静」。
+         *
+         * 教训：一个「只为重排定时器」而存在的入口，如果同时还能替换核心回调，
+         * 调用方就一定会顺手把回调填错。故这个入口只做重排这一件事。
+         */
+        rearm() {
             for (const hook of hooks.values()) armTimer(hook);
         },
         /**
@@ -524,7 +540,6 @@ export function createRateLimitResumeEngine(options = {}) {
                 }
             }
             hooks.clear();
-            deliver = undefined;
         },
     };
 }
@@ -671,8 +686,11 @@ export function installRateLimitResume(ctx, pool) {
 
     ctx.inject(['agents'], (scope) => {
         agentsScope = scope;
-        // 投递通道就绪：之前因缺通道被推迟的钩子会按原解禁时刻重排。
-        engine.setDeliver(() => {});
+        // 投递通道本来就已经就绪了（构造时注入的闭包），这里只是「agents 到位了，
+        // 把可能因为缺通道被推迟的钩子按原解禁时刻重排一遍」。
+        // ⚠️ 千万别写成 `setDeliver(() => {})` —— 那会把真正能投递的函数换掉，
+        // 见 `rearm()` 的注释（1.1.0~2.0.0 的真实缺陷）。
+        engine.rearm();
         const dispose = scope.on('agent/disposed', ({ agent }) => { engine.forget(agent.id); });
         teardown.push(dispose);
     });

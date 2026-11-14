@@ -432,3 +432,64 @@ test('续跑消息的 source 是自己的标识，绝不能冒充 user', () => {
   // 提示里不能出现 harness 内部词汇（那是给用户看的诊断，模型不需要）。
   assert.doesNotMatch(engine.RATE_LIMIT_RESUME_PROMPT, /钩子|解禁时刻|armed/);
 });
+
+// ===== 真机回归 2026-11-14：按钮有了，时间到了却什么都不发生 =====
+//
+// 报障原文：「自动继续那个功能不对呀。现在看得到那个按钮了，但时间到了它也没有
+// 自动继续。」——钩子建了、定时器排了、RPC 也正常（所以按钮在、能点、会持久化），
+// 但**到点那次投递从来没成功过**。
+//
+// 根因不在判据，而在接线：`installRateLimitResume` 的 `ctx.inject(['agents'])`
+// 回调里写的是 `engine.setDeliver(() => {})`（本意是「agents 到位了，重排一下
+// 定时器」），而这个入口当时还会**替换**投递函数 —— 于是真正经 agents 作用域
+// 投递的那个闭包被换成了返回 `undefined` 的空函数。`attempt()` 见 `result.ok`
+// 不是 `true` ⇒ 判投递失败 ⇒ 按 5 分钟重试 ⇒ 24 次后丢弃（`deferrals` 上限）。
+// 真机上「等一小时」只观察一次，看到的就是「什么都没发生」。
+//
+// 这类缺陷上面那些用例全都抓不到：它们直接给 `deliver` 传一个能用的假函数，
+// 从不经过 install 真正的那条注入路径。故本条**按 install 的实际调用顺序**回放：
+// 构造时注入真投递 ⇒ 中途调一次「agents 就绪」的入口 ⇒ 到点必须真投出去。
+test('真机回归：install 的「agents 就绪」入口不能把投递通道换掉', () => {
+  const engine = loadEngine();
+  let now = 1_000_000;
+  const timers = [];
+  const delivered = [];
+
+  const api = engine.createRateLimitResumeEngine({
+    now: () => now,
+    schedule: (task, delay) => { const handle = { task, delay }; timers.push(handle); return handle; },
+    cancel: (handle) => { const at = timers.indexOf(handle); if (at >= 0) timers.splice(at, 1); },
+    // 这就是 install 传进来的那个函数的样子：一个**闭包**，内部才去解析
+    // agents 作用域；它没有理由在构造之后被替换。
+    deliver: (hook) => { delivered.push(hook); return { ok: true }; },
+    enabled: true,
+  });
+
+  api.noteInterruption({ sessionId: 'session-real', turn: 2, kind: 'rate', resetAtMs: now + 60_000 });
+  assert.equal(timers.length, 1);
+
+  // `ctx.inject(['agents'], …)` 到点执行时做的唯一一件事。
+  api.rearm();
+
+  now += 60_000;
+  timers.splice(0)[0].task();
+
+  assert.equal(delivered.length, 1, '到点必须真的投递一次（缺陷版这里是 0）');
+  assert.equal(api.status().hooks.length, 0, '投递成功后钩子应被清掉');
+  assert.equal(timers.length, 0, '不该留下重试定时器');
+});
+
+test('真机回归：引擎不再暴露可替换投递函数的入口', () => {
+  const engine = loadEngine();
+  const api = engine.createRateLimitResumeEngine({
+    now: () => 1_000_000,
+    schedule: () => ({ task: () => {}, delay: 0 }),
+    cancel: () => {},
+    deliver: () => ({ ok: true }),
+    enabled: true,
+  });
+  // 那个能换掉 deliver 的入口必须彻底消失：留着就还会有人（包括未来的我）
+  // 顺手在「只是想重排」的地方传一个空函数进去。
+  assert.equal(typeof api.setDeliver, 'undefined', '不该再有能替换投递函数的入口');
+  assert.equal(typeof api.rearm, 'function', '重排入口要在');
+});
